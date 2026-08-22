@@ -572,7 +572,29 @@ def analyze(repo, since, max_files_per_commit, patterns=EXCLUDE):
     )
 
 
-def cluster_stats(clusters, files, edges):
+def dev_days(commits, mapping=None):
+    """Distinct (author, calendar day) pairs — a cheap stand-in for person-days.
+
+    Neither churn nor commit count measures effort. Churn counts lines, and one
+    regenerated fixture outweighs a fortnight of careful work. Commits count habits:
+    the same day's work is ten small commits from one person and one big commit from
+    the next. Days on which a person touched the code is much closer to time actually
+    spent, and git already carries everything it needs.
+
+    Still a proxy, and it has a known bias: a day someone spent ten minutes here counts
+    the same as a day they spent eight hours. It is right about where attention goes,
+    not about how many hours went there.
+    """
+    stamped = commits.assign(
+        who_when=commits.author.fillna("") + "|" + commits.date.str[:10]
+    )
+    if mapping is None:
+        return stamped.who_when.nunique()
+    grouped = stamped.assign(group=stamped.path.map(mapping)).dropna(subset=["group"])
+    return grouped.groupby("group").who_when.nunique()
+
+
+def cluster_stats(clusters, files, edges, commits=None):
     """One row per cluster, for the table under the cluster treemap. Pure — no git.
 
     The treemap answers "which cluster is big". This answers "and is it worth opening":
@@ -611,6 +633,16 @@ def cluster_stats(clusters, files, edges):
         inside = linked[linked.ca == linked.cb].groupby("ca").weight.sum()
         cohesion = (inside.reindex(total.index).fillna(0) / total).round(2)
 
+    # Person-days beat both churn and commits as a read on effort; see dev_days().
+    # Optional so the frame stays usable without a commits table to hand.
+    blank = pd.Series(0, index=by_cluster.size().index)
+    days = blank if commits is None else dev_days(
+        commits, files.set_index("path").cluster_id).reindex(blank.index).fillna(0).astype(int)
+    people = blank if commits is None else (
+        commits.assign(c=commits.path.map(files.set_index("path").cluster_id))
+        .dropna(subset=["c"]).groupby("c").author.nunique()
+        .reindex(blank.index).fillna(0).astype(int))
+
     out = pd.DataFrame({
         "cluster": clusters.set_index("cluster_id").label,
         "modules": by_cluster.apply(module_list),
@@ -621,6 +653,10 @@ def cluster_stats(clusters, files, edges):
         "churn/line": (live.churn.sum() / live.lines.sum()).round(2),
         "rework/line": (live.rework.sum() / live.lines.sum()).round(2),
         "commits": clusters.set_index("cluster_id").total_commits,
+        # Where the team's attention went, as opposed to where the lines went.
+        "devs": people,
+        "dev-days": days,
+        "effort": (days / days.sum()).round(3) if days.sum() else days,
         "cohesion": cohesion,
         "hotspot": by_cluster.apply(lambda g: g.path.iat[g.churn.values.argmax()]),
         "in hotspot": top.round(2),
@@ -630,7 +666,7 @@ def cluster_stats(clusters, files, edges):
     # Aligning against by_cluster (which still holds every cluster, including any the
     # caller filtered out) turns whole-number columns into floats via NaN. Undo that
     # after the reindex has dropped the extra rows, so counts render as counts.
-    for column in ("files", "churn", "commits", "rework"):
+    for column in ("files", "churn", "commits", "rework", "devs", "dev-days"):
         out[column] = out[column].fillna(0).astype(int)
     return out.reset_index(drop=True)
 
@@ -706,6 +742,8 @@ def summarise(clusters, files, commits):
         # deleted files in the numerator only, inflating every repo.
         "density": round(live.churn.sum() / lines_now, 2) if lines_now else None,
         "rework": int(live.rework.sum()),
+        "dev_days": int(dev_days(commits)),
+        "devs": int(commits.author.nunique()),
         # The repo-level answer to "how much of this was rewriting, not writing".
         "rework_density": round(live.rework.sum() / lines_now, 2) if lines_now else None,
         "top_module": top_module,
@@ -968,6 +1006,21 @@ def demo():
     assert s["density"] == round(23 / 150, 2), s["density"]
 
     assert s["rework"] == 8 and s["rework_density"] == round(8 / 150, 2), s
+    # Three commits, but Ava made two of them on different days and Bo one: 3 person-
+    # days, 2 people. Same-day commits by one person would have collapsed to one.
+    assert s["dev_days"] == 3 and s["devs"] == 2, s
+    same_day = df.assign(author="Ava", date="2026-01-05T10:00:00+00:00")
+    assert dev_days(same_day) == 1, dev_days(same_day)
+
+    # dev_days per cluster, and effort as a share of the repo's days.
+    stats = cluster_stats(clusters, files, edges, df).set_index("cluster")
+    api, un = stats.loc["#0 api (2 files)"], stats.loc["unclustered (1 files)"]
+    # api/*.py moved on two days (Ava then Bo); web/app.js on one (Ava).
+    assert api["dev-days"] == 2 and api.devs == 2, api
+    assert un["dev-days"] == 1 and un.devs == 1, un
+    assert api.effort == round(2 / 3, 3), api.effort
+    # Effort is optional: without a commits table the columns are zero, not missing.
+    assert cluster_stats(clusters, files, edges)["dev-days"].sum() == 0
 
     gone = files.assign(lines=float("nan"))
     assert summarise(clusters, gone, df)["density"] is None

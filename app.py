@@ -317,9 +317,9 @@ if screen == "portfolio":
         "rework_density": "rework/line", "lines_now": "lines"}).sort_values(
             "rework", ascending=False)
     picked = st.dataframe(
-        shown[["project", "rework", "rework/line", "lines", "churn", "density",
-               "files", "commits", "clusters", "cross-module", "top_module",
-               "analyzed"]
+        shown[["project", "dev_days", "devs", "rework", "rework/line", "lines",
+               "churn", "density", "files", "commits", "clusters", "cross-module",
+               "top_module", "analyzed"]
               + (["error"] if shown.error.notna().any() else [])],
         hide_index=True, width="stretch",
         on_select="rerun", selection_mode="single-cell", key="portfolio_tbl",
@@ -331,6 +331,14 @@ if screen == "portfolio":
             ),
             "rework/line": st.column_config.NumberColumn(
                 format="%.2f", help="Rework per surviving line."
+            ),
+            "dev_days": st.column_config.NumberColumn(
+                "dev-days", format="%d",
+                help="Distinct (person, day) pairs — where the team's time went. Rank "
+                     "by this to fund a team; rank by rework/line to fund a refactor.",
+            ),
+            "devs": st.column_config.NumberColumn(
+                format="%d", help="People who touched this repo in the window."
             ),
             "lines": st.column_config.NumberColumn(
                 format="%d",
@@ -431,7 +439,8 @@ if screen == "clusters":
     cards = st.columns(5)
     cards[0].metric("Churn", f"{int(files.churn.sum()):,}")
     cards[1].metric("Commits", f"{commits.sha.nunique():,}")
-    cards[2].metric("Files touched", f"{len(files):,}")
+    cards[2].metric("Person-days", f"{churn.dev_days(commits):,}",
+                    delta=f"{commits.author.nunique()} people", delta_color="off")
     cards[3].metric(
         "Clusters", len(real),
         delta=f"{int((real.num_modules > 1).sum())} cross-module",
@@ -449,7 +458,7 @@ if screen == "clusters":
     )
 
     st.markdown("##### Clusters")
-    table = churn.cluster_stats(shown, files, edges)
+    table = churn.cluster_stats(shown, files, edges, commits)
     picked = st.dataframe(
         table, hide_index=True, width="stretch",
         on_select="rerun", selection_mode="single-cell", key="clusters_tbl",
@@ -479,6 +488,22 @@ if screen == "clusters":
             ),
             "commits": st.column_config.NumberColumn(
                 format="%d", help="Distinct commits touching the cluster."
+            ),
+            "devs": st.column_config.NumberColumn(
+                format="%d", help="People who touched this cluster."
+            ),
+            "dev-days": st.column_config.NumberColumn(
+                format="%d",
+                help="Distinct (person, day) pairs — the closest cheap read on effort. "
+                     "Churn measures lines, and one regenerated fixture outweighs a "
+                     "fortnight of careful work.",
+            ),
+            "effort": st.column_config.ProgressColumn(
+                "effort", format="percent", min_value=0.0,
+                max_value=float(table.effort.max()) if len(table) else 1.0,
+                help="This cluster's share of the repo's person-days. Sort by this to "
+                     "find where the team's time is going, which is often not where "
+                     "the churn is.",
             ),
             "cohesion": st.column_config.NumberColumn(
                 format="%.2f",
@@ -552,7 +577,7 @@ elif screen == "files":
     if label:
         goto("detail", file_path=label)
 
-    summary = churn.cluster_stats(cluster_row, files, edges).iloc[0]
+    summary = churn.cluster_stats(cluster_row, files, edges, commits).iloc[0]
     cluster_commits = commits[commits.path.isin(in_cluster.path)].sha.nunique()
     cards = st.columns(6)
     cards[0].metric("Churn", f"{int(summary.churn):,}",

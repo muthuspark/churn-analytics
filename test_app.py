@@ -27,6 +27,12 @@ def main(repo):
         .path.iat[0]
     )
 
+    def button(label):
+        """Address buttons by label. Positional indexing silently retargets when the
+        sidebar is reordered, and "Analyze" and the "repo" crumb both land on the
+        cluster screen, so a mix-up between them passes for the wrong reason."""
+        return [b for b in at.button if b.label == label][0]
+
     at = AppTest.from_file(APP, default_timeout=300).run()
     assert not at.exception, at.exception
 
@@ -38,7 +44,7 @@ def main(repo):
         assert at.error, "expected a git error for a non-repo path"
 
     at.text_input[0].set_value(repo)
-    at.button[0].click().run()
+    button("Analyze").click().run()
     assert not at.exception, at.exception
     assert len(at.get("plotly_chart")) == 1
 
@@ -77,7 +83,7 @@ def main(repo):
     at.session_state["screen"] = "detail"
     at.session_state["file_path"] = top_file
     at.run()
-    at.button[0].click().run()  # "repo" breadcrumb
+    button("repo").click().run()
     assert not at.exception, at.exception
     assert at.session_state["screen"] == "clusters"
 
@@ -87,7 +93,7 @@ def main(repo):
     at.run()
     assert at.session_state["screen"] == "files"
     at.text_input[0].set_value(repo)
-    [b for b in at.button if b.label == "Analyze"][0].click().run()
+    button("Analyze").click().run()
     assert not at.exception, at.exception
     assert at.session_state["cluster_id"] is None, at.session_state["cluster_id"]
     assert at.session_state["screen"] == "clusters"

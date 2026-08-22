@@ -143,7 +143,7 @@ Louvain runs with a fixed seed, so the same input gives the same output — but 
 
 The **editorial** theme from [awesome-streamlit-themes](https://github.com/jmedia65/awesome-streamlit-themes/tree/main/editorial) — Playfair Display headings, Lora body, Source Code Pro for code, on white. Fonts are served locally from `static/` (hence `enableStaticServing = true`), so there's no CDN dependency and the app works offline.
 
-The chart palette in `app.py` (`HOT`, `COOL`, `PAPER`, `SCALE`) is tuned to match it. If you swap the theme, those four constants are the only things to revisit.
+The chart palette in `app.py` (`HOT`, `COOL`, `SCALE`) is tuned to match it. If you swap the theme, those three constants are the only things to revisit.
 
 ## Using the pipeline directly
 

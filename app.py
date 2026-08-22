@@ -13,7 +13,6 @@ st.set_page_config(page_title="Churn clusters", layout="wide")
 # Chart palette, kept in step with .streamlit/config.toml (editorial theme).
 HOT = "#c41e3a"      # theme primaryColor
 COOL = "#c9c9c9"     # light enough that plotly picks dark label text
-PAPER = "#ffffff"    # plotly wraps top-level boxes in a dark virtual root
 # The darkest two OrRd steps are near-black, and a global theme font colour stops
 # plotly from flipping label text to white on them. Drop them.
 SCALE = px.colors.sequential.OrRd[:-2]
@@ -34,6 +33,20 @@ def goto(screen, **kwargs):
     st.rerun()
 
 
+def set_root_hover(fig, text):
+    """A treemap needs one explicit root row, or plotly draws its own and paints the
+    header dark — `root.color`, `depthfade` and `tiling.pad` all leave it alone (only
+    a real row picks up the colour scale). The root has no source row though, so its
+    customdata is empty and its hover would read "(?)". Fill it in."""
+    trace = fig.data[0]
+    data = trace.customdata
+    for i, parent in enumerate(trace.parents):
+        if not parent:  # the root is the only node without a parent
+            data[i] = [text]
+    trace.customdata = data
+    return fig
+
+
 def clicked_label(key, known):
     """Label of the clicked treemap box, or None if there is no usable selection.
 
@@ -51,7 +64,11 @@ def clicked_label(key, known):
 
 with st.sidebar:
     repo = st.text_input("Repo path", value=".")
-    since = st.text_input("Since", value="12 months ago")
+    months = st.number_input(
+        "Months of history", 1, 24, 12,
+        help="How far back to read git log.",
+    )
+    since = f"{int(months)} months ago"
     max_files = st.number_input(
         "Max files per commit", 2, 500, 30,
         help="Commits touching more files are ignored when building the co-change graph.",
@@ -60,19 +77,26 @@ with st.sidebar:
         "Exclude globs", value="\n".join(churn.EXCLUDE), height=140,
         help="Generated files and lockfiles. They dominate churn and fake cross-module coupling.",
     )
-    analyzed = st.button("Analyze", type="primary")
     # Render-time only: not analyze() arguments, so moving these does not bust the cache.
     hot_pct = st.slider("Highlight top % churn", 1, 100, 20)
     size_by = st.radio(
         "Size files by", ["churn", "churn / line"], horizontal=True,
-        help="Raw churn ranks big files highest just for being big. Per-line ranks by "
-             "how often a file has effectively been rewritten.",
+        help=(
+            "- **churn** — *where did our effort actually go?* Honest about time "
+            "spent. Use it to orient on a new repo.\n"
+            "- **churn / line** — *which files are unstable for their size?* This is "
+            "the one that finds rework: code being rewritten rather than extended. "
+            "Use it when hunting for something to redesign.\n\n"
+            "Raw churn correlates with file size, so big files rank high just for "
+            "being big. Per-line divides that out."
+        ),
     )
     show_unclustered = st.checkbox(
         "Show unclustered", value=False,
         help="Files that never co-changed inside the commit-size cap. Usually most of "
              "the repo, so they crowd out the real clusters.",
     )
+    analyzed = st.button("Analyze", type="primary")
 
 if analyzed:
     # Louvain renumbers clusters on every run, so a surviving cluster_id would point
@@ -107,27 +131,34 @@ if screen == "detail":
 
 if screen == "clusters":
     shown = clusters if show_unclustered else clusters[clusters.cluster_id != -1]
-    # No px.Constant root: the breadcrumb already names the level, and a synthetic
-    # root has no row behind it, so its hover renders "(?)" for every custom field.
+    # One prebuilt hover string per row, rather than several customdata fields, so the
+    # root can be given a sensible line too (see set_root_hover).
+    shown = shown.assign(
+        hover=shown.apply(
+            lambda r: f"{r.label}<br>churn {r.total_churn:,}<br>{r.total_commits} commits"
+            f"<br>{r.num_files} files across {r.num_modules} module(s)",
+            axis=1,
+        )
+    )
     fig = px.treemap(
         shown,
-        path=["label"],
+        path=[px.Constant("repo"), "label"],
         values="total_churn",
         # Modules spanned, not file count: area already shows size, so spend the color
         # channel on the thing you'd act on. 1 = contained, higher = coupling to chase.
         color="num_modules",
         color_continuous_scale=SCALE,
         range_color=(1, max(2, int(shown.num_modules.max()))),
-        custom_data=["total_commits", "num_modules", "num_files"],
+        custom_data=["hover"],
     )
     fig.update_traces(
-        hovertemplate="%{label}<br>churn %{value}<br>%{customdata[0]} commits"
-        "<br>%{customdata[2]} files across %{customdata[1]} module(s)<extra></extra>",
-        # Plotly wraps top-level boxes in a virtual root and paints its header dark;
-        # on a light theme that reads as a stray band. It has no data row, so the
-        # colour has to be set here rather than through the colour mapping.
-        root=dict(color=PAPER),
+        hovertemplate="%{customdata[0]}<extra></extra>",
         pathbar_visible=False,  # the app's own breadcrumb row does this job
+    )
+    set_root_hover(
+        fig,
+        f"{len(shown)} clusters<br>churn {int(shown.total_churn.sum()):,}"
+        f"<br>{int(shown.num_files.sum())} files",
     )
     fig.update_coloraxes(colorbar_title_text="modules")
     fig.update_layout(height=560, margin=dict(t=30, l=0, r=0, b=0))
@@ -148,23 +179,31 @@ elif screen == "files":
         # NaN would reach the hover template as "null".
         lines_txt=sized.lines.map(lambda n: "gone" if pd.isna(n) else f"{int(n)}"),
     )
+    sized = sized.assign(
+        hover=sized.apply(
+            lambda r: f"{r.path}<br>{metric} {r[metric]:,}<br>churn {r.churn:,}"
+            f" · lines {r.lines_txt}<br>{r.commits} commits",
+            axis=1,
+        )
+    )
     dropped = len(in_cluster) - len(sized)
     if dropped:
         st.caption(f"{dropped} file(s) hidden: not in HEAD, so no per-line figure.")
     fig = px.treemap(
         sized,
-        path=["path"],
+        path=[px.Constant(cluster_label), "path"],
         values=metric,
         color="hot",
-        color_discrete_map={"hot": HOT, "normal": COOL, "(?)": PAPER},
-        custom_data=["commits", "churn", "lines_txt"],
+        # "(?)" is the root, which px leaves uncoloured.
+        color_discrete_map={"hot": HOT, "normal": COOL, "(?)": COOL},
+        custom_data=["hover"],
     )
     fig.update_traces(
-        hovertemplate="%{label}<br>" + metric + " %{value}"
-        "<br>churn %{customdata[1]} · lines %{customdata[2]}"
-        "<br>%{customdata[0]} commits<extra></extra>",
-        root=dict(color=PAPER),
+        hovertemplate="%{customdata[0]}<extra></extra>",
         pathbar_visible=False,
+    )
+    set_root_hover(
+        fig, f"{cluster_label}<br>{len(sized)} files<br>churn {int(sized.churn.sum()):,}"
     )
     fig.update_layout(height=560, margin=dict(t=30, l=0, r=0, b=0))
     st.plotly_chart(fig, on_select="rerun", key="files_tm", width="stretch")

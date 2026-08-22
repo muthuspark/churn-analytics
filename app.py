@@ -1,5 +1,6 @@
 """Churn explorer: portfolio -> cluster treemap -> file treemap -> per-file detail."""
 
+import html
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -38,10 +39,87 @@ def analyze(repo, since, max_files_per_commit, patterns):
     return churn.analyze(repo, since, max_files_per_commit, patterns)
 
 
+@st.cache_data(show_spinner="Reading hunks...")
+def file_hunks(repo, path, since):
+    """Per-hunk history for one file. Deliberately not part of analyze(): it is one
+    extra `git log -p` per file, so it runs when someone opens that file's page rather
+    than 64 times up front. Around 0.1-0.5s on the biggest files measured."""
+    return churn.parse_hunks(churn.git_file_hunks(repo, path, since))
+
+
+@st.cache_data(show_spinner="Scanning line bands...")
+def line_bands(repo, path, since, lines):
+    """Up to 48 `git log -L` calls, run concurrently. Fine enough to paint the source
+    line by line; merge_bands folds them down for the chart, so this scan happens once.
+    Cached, and only ever for the one file being looked at."""
+    bands = churn.line_bands(repo, path, since, lines)
+    # Second pass only where the heat already is: a flat scan of a 10k-line file gives
+    # 215-line slices, too coarse to point at a function.
+    return churn.refine_bands(repo, path, since, bands)
+
+
+@st.cache_data(show_spinner=False)
+def file_source(repo, path):
+    return churn.git_file_source(repo, path)
+
+
+MAX_PAINTED = 4000
+
+
+def heat_source(repo, path, bands, lines):
+    """The file itself, each line tinted by how often its neighbourhood changed.
+
+    The bar chart says a slice is hot; this says which code is in it. Colour is the
+    band's commit count, so resolution is the band width -- a line is as hot as its
+    neighbourhood, not measured on its own. Plain monospace rather than syntax
+    highlighting: two colour systems on the same characters and neither reads.
+    """
+    source = file_source(repo, path).splitlines()
+    if not source:
+        return
+    heat = churn.line_heat(bands, len(source))
+    hottest = max(heat) or 1
+    clipped = len(source) > MAX_PAINTED
+
+    rows = []
+    for number, (text, hits) in enumerate(zip(source[:MAX_PAINTED], heat), start=1):
+        # Alpha, not a palette lookup: it tints whatever background the viewer's theme
+        # paints, and leaves the text colour alone so the code stays readable.
+        shade = f"rgba(196,30,58,{0.07 + 0.5 * hits / hottest:.3f})" if hits else "transparent"
+        rows.append(
+            f'<div style="background:{shade}" title="line {number} &middot; '
+            f'{hits} commits"><span style="display:inline-block;width:4.5em;'
+            f'text-align:right;padding-right:1em;opacity:.45">{number}</span>'
+            f"{html.escape(text) or '&nbsp;'}</div>"
+        )
+
+    with st.expander(f"Show the code, painted ({len(source):,} lines)"):
+        st.html(
+            '<div style="max-height:640px;overflow:auto;font-family:ui-monospace,'
+            'SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5;'
+            'white-space:pre;border:1px solid rgba(128,128,128,.25);border-radius:6px">'
+            + "".join(rows) + "</div>"
+        )
+        st.caption(
+            f"Darker = more commits touching that slice, up to {hottest} at the peak. "
+            f"Slices are {bands.end.sub(bands.start).add(1).max()} lines wide, so the "
+            "shade is the neighbourhood's, not the single line's. Untinted lines were "
+            "never touched in the window."
+            + (f" Showing the first {MAX_PAINTED:,} lines." if clipped else "")
+        )
+
+
 def repo_name(path):
     """Last two segments, so sibling projects stay distinguishable."""
     parts = Path(path).parts[-2:]
     return "/".join(parts) if parts else path
+
+
+def tail_of(path, keep=2):
+    """Last few segments of a path. A deep Java path wraps the breadcrumb onto two
+    lines and breaks its alignment; the full path still goes in the tooltip."""
+    parts = path.split("/")
+    return path if len(parts) <= keep else ".../" + "/".join(parts[-keep:])
 
 
 def goto(screen, **kwargs):
@@ -104,15 +182,16 @@ with st.sidebar:
     # Render-time only: not analyze() arguments, so moving these does not bust the cache.
     hot_pct = st.slider("Highlight top % churn", 1, 100, 20)
     size_by = st.radio(
-        "Size by", ["churn", "churn / line"], horizontal=True,
+        "Size by", ["rework", "churn", "churn / line"], horizontal=True,
         help=(
+            "- **rework** — *what is being rewritten?* Lines a commit both added and "
+            "removed. A file written once has churn but no rework, so one-shot "
+            "additions stop crowding out the real hotspots. Start here.\n"
             "- **churn** — *where did our effort actually go?* Honest about time "
-            "spent. Use it to orient on a new repo.\n"
-            "- **churn / line** — *which files are unstable for their size?* This is "
-            "the one that finds rework: code being rewritten rather than extended. "
-            "Use it when hunting for something to redesign.\n\n"
-            "Raw churn correlates with file size, so big files rank high just for "
-            "being big. Per-line divides that out."
+            "spent, but it cannot tell writing from rewriting.\n"
+            "- **churn / line** — *which files are unstable for their size?* Divides "
+            "out the fact that big files churn more just for being big.\n\n"
+            "Rework is the one that points at redesign candidates."
         ),
     )
     show_unclustered = st.checkbox(
@@ -168,25 +247,38 @@ if screen == "portfolio":
         st.stop()
     portfolio = store.load_repos(conn, repo_paths)
     done = portfolio[portfolio.total_churn.notna()]
+    # The sidebar drives the live per-file screens, but the portfolio rows are whatever
+    # window they were last analysed in. Silently mixing the two makes the drill-down
+    # disagree with the table it came from, and nothing on screen says why.
+    stale = done[done.since_months.notna() & (done.since_months != int(months))]
+    if not stale.empty:
+        windows = ", ".join(f"{int(m)}" for m in sorted(stale.since_months.unique()))
+        st.warning(
+            f"Sidebar is set to **{int(months)} months**, but {len(stale)} row(s) were "
+            f"analysed over {windows}. The cluster and file screens read the sidebar "
+            "value live, so they will not match this table until you re-run.",
+            icon=":material/history:",
+        )
     if done.empty:
         st.info(f"{len(repo_paths)} repo(s) listed, none analysed yet. Press Analyze all.")
     else:
-        metric = "total_churn" if size_by == "churn" else "density"
+        metric = {"rework": "rework", "churn": "total_churn"}.get(size_by, "density")
         ranked = done[done[metric].notna()].assign(
             hover=lambda d: d.apply(
                 lambda r: f"{r['name']}<br>churn {int(r.total_churn):,}"
+                f"<br>rework {int(r.rework):,} ({r.rework_density} /line)"
                 f"<br>density {r.density}<br>{int(r.num_files)} files"
                 f" · {int(r.total_commits)} commits", axis=1)
         )
         fig = px.treemap(
             ranked, path=[px.Constant("projects"), "name"], values=metric,
-            color="density", color_continuous_scale=SCALE, custom_data=["hover"],
+            color="rework_density", color_continuous_scale=SCALE, custom_data=["hover"],
         )
         fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>",
                           pathbar_visible=False)
         set_root_hover(fig, f"{len(ranked)} projects<br>churn "
                             f"{int(ranked.total_churn.sum()):,}")
-        fig.update_coloraxes(colorbar_title_text="churn/line")
+        fig.update_coloraxes(colorbar_title_text="rework/line")
         fig.update_layout(height=520, margin=dict(t=30, l=0, r=0, b=0))
         st.plotly_chart(fig, on_select="rerun", key="portfolio_tm", width="stretch")
         picked = clicked_label("portfolio_tm", set(ranked.name))
@@ -197,11 +289,23 @@ if screen == "portfolio":
     shown = portfolio.rename(columns={
         "name": "project", "total_churn": "churn", "num_files": "files",
         "total_commits": "commits", "num_clusters": "clusters",
-        "cross_module": "cross-module", "analyzed_at": "analyzed"})
+        "cross_module": "cross-module", "analyzed_at": "analyzed",
+        "rework_density": "rework/line"}).sort_values("rework", ascending=False)
     st.dataframe(
-        shown[["project", "churn", "density", "files", "commits", "clusters",
-               "cross-module", "top_module", "analyzed", "error"]],
+        shown[["project", "rework", "rework/line", "churn", "density", "files",
+               "commits", "clusters", "cross-module", "top_module", "analyzed"]
+              + (["error"] if shown.error.notna().any() else [])],
         hide_index=True, width="stretch",
+        column_config={
+            "rework": st.column_config.NumberColumn(
+                format="%d",
+                help="Lines a single commit both added and removed — rewriting, not "
+                     "writing. Blank means this repo predates the metric; re-run it.",
+            ),
+            "rework/line": st.column_config.NumberColumn(
+                format="%.2f", help="Rework per surviving line."
+            ),
+        },
     )
     st.stop()
 
@@ -224,15 +328,26 @@ cluster_label = cluster_row.label.iat[0] if len(cluster_row) else None
 if screen != "clusters" and cluster_label is None:
     goto("clusters")  # cluster ids are not stable across re-analysis
 
-crumbs = st.columns(4)
-if crumbs[0].button("projects"):
-    goto("portfolio")
-if crumbs[1].button(repo_name(repo), disabled=screen == "clusters"):
-    goto("clusters")
-if cluster_label and crumbs[2].button(cluster_label, disabled=screen == "files"):
-    goto("files")
+# (label, screen to jump to or None for the current page, tooltip)
+trail = [("projects", "portfolio", None), (repo_name(repo), "clusters", repo)]
+if cluster_label:
+    # "(94 files)" is already in the metrics below; the crumb only needs identity.
+    trail.append((cluster_label.split(" (")[0], "files", cluster_label))
 if screen == "detail":
-    crumbs[3].markdown(f"**{st.session_state.file_path}**")
+    file_path = st.session_state.file_path
+    trail.append((tail_of(file_path), None, file_path))
+
+# A flex row, not st.columns: four equal columns space the crumbs at 25% intervals,
+# which reads as four separate controls rather than one path. Tertiary buttons render
+# as links, because a breadcrumb is navigation and not a row of actions.
+with st.container(horizontal=True, gap="small", vertical_alignment="center"):
+    for step, (text, target, tip) in enumerate(trail):
+        if step:
+            st.markdown(":gray[/]")
+        if target is None or target == screen:
+            st.markdown(f"**{text}**", help=tip)  # you are here
+        elif st.button(text, key=f"crumb{step}", type="tertiary", help=tip):
+            goto(target)
 
 if screen == "clusters":
     shown = clusters if show_unclustered else clusters[clusters.cluster_id != -1]
@@ -272,9 +387,86 @@ if screen == "clusters":
     if label:
         goto("files", cluster_id=int(clusters.loc[clusters.label == label, "cluster_id"].iat[0]))
 
+    real = clusters[clusters.cluster_id != -1]
+    loose = clusters[clusters.cluster_id == -1]
+    top = files.loc[files.churn.idxmax()]
+    cards = st.columns(5)
+    cards[0].metric("Churn", f"{int(files.churn.sum()):,}")
+    cards[1].metric("Commits", f"{commits.sha.nunique():,}")
+    cards[2].metric("Files touched", f"{len(files):,}")
+    cards[3].metric(
+        "Clusters", len(real),
+        delta=f"{int((real.num_modules > 1).sum())} cross-module",
+        delta_color="off",
+    )
+    # Churn that never co-changed with anything is churn the cluster view cannot explain.
+    cards[4].metric(
+        "Unclustered", f"{int(loose.total_churn.sum() / files.churn.sum() * 100)}%",
+        delta=f"{int(loose.num_files.iat[0]) if len(loose) else 0} files",
+        delta_color="off",
+    )
+    st.caption(
+        f"Biggest single file: `{top.path}` — {int(top.churn):,} churn "
+        f"({top.churn / files.churn.sum():.0%} of the repo) over {int(top.commits)} commits."
+    )
+
+    st.markdown("##### Clusters")
+    table = churn.cluster_stats(shown, files, edges)
+    st.dataframe(
+        table, hide_index=True, width="stretch",
+        column_config={
+            "cluster": st.column_config.TextColumn(width="medium"),
+            "modules": st.column_config.TextColumn(
+                help="Top-level directories the cluster spans, biggest churn first."
+            ),
+            "churn": st.column_config.NumberColumn(format="%d"),
+            "share": st.column_config.ProgressColumn(
+                "share", format="percent", min_value=0.0,
+                max_value=float(table.share.max()) if len(table) else 1.0,
+                help="This cluster's churn as a fraction of the whole repo's.",
+            ),
+            "rework": st.column_config.NumberColumn(
+                format="%d", help="Lines a single commit both added and removed."
+            ),
+            "rework/line": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Rework per surviving line. The redesign signal — unlike "
+                     "churn/line it ignores code that was only ever written once.",
+            ),
+            "churn/line": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Rewrites per surviving line. High = rework, not growth. "
+                     "Deleted files are left out of both sides.",
+            ),
+            "commits": st.column_config.NumberColumn(
+                format="%d", help="Distinct commits touching the cluster."
+            ),
+            "cohesion": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Of all co-change pairs touching these files, the fraction that "
+                     "stay inside the cluster. 1.00 = self-contained. Low = the real "
+                     "unit of change is bigger than this cluster.",
+            ),
+            "hotspot": st.column_config.TextColumn(
+                width="large", help="Highest-churn file in the cluster."
+            ),
+            "in hotspot": st.column_config.NumberColumn(
+                format="percent",
+                help="Share of the cluster's churn in that one file. Near 100% means "
+                     "this is one hot file, not a cluster worth opening.",
+            ),
+            "last": st.column_config.TextColumn(help="Most recent month touched."),
+        },
+    )
+    st.caption(
+        "Read it as: **share** = how much of the repo, **churn/line** = how much "
+        "rework, **cohesion** = whether the cluster is a real boundary, "
+        "**in hotspot** = whether it is really just one file."
+    )
+
 elif screen == "files":
     in_cluster = files[files.cluster_id == cluster_id]
-    metric = "churn" if size_by == "churn" else "density"
+    metric = {"rework": "rework", "churn": "churn"}.get(size_by, "density")
     # Deleted files have no density, so they drop out of the per-line view entirely
     # rather than being sized as if they were still live code.
     sized = in_cluster.dropna(subset=[metric])
@@ -316,6 +508,91 @@ elif screen == "files":
     if label:
         goto("detail", file_path=label)
 
+    summary = churn.cluster_stats(cluster_row, files, edges).iloc[0]
+    cluster_commits = commits[commits.path.isin(in_cluster.path)].sha.nunique()
+    cards = st.columns(6)
+    cards[0].metric("Churn", f"{int(summary.churn):,}",
+                    delta=f"{summary.share:.0%} of repo", delta_color="off")
+    cards[1].metric("Files", int(summary.files))
+    cards[2].metric("Commits", f"{cluster_commits:,}")
+    cards[3].metric("Churn / line", "—" if pd.isna(summary["churn/line"])
+                    else f"{summary['churn/line']:.2f}")
+    cards[4].metric("Cohesion", "—" if pd.isna(summary.cohesion)
+                    else f"{summary.cohesion:.0%}",
+                    delta="stays in cluster", delta_color="off")
+    cards[5].metric("Modules", summary.modules.split(",")[0].strip(),
+                    delta=summary.modules, delta_color="off")
+
+    st.markdown("##### Files")
+    table = churn.file_stats(files, edges, cluster_id)
+    hidden = table.lines.isna().sum()
+    if hidden:
+        st.caption(
+            f"{hidden} of {len(table)} file(s) are not in HEAD. The treemap has to drop "
+            "them — no size to draw — but their churn is real, so they are listed here "
+            "with a blank per-line figure."
+        )
+    st.dataframe(
+        table, hide_index=True, width="stretch",
+        column_config={
+            "file": st.column_config.TextColumn(width="large"),
+            "debt": st.column_config.NumberColumn(
+                format="%.2f",
+                help="rework/line x log2(1 + commits). Rewriting, weighted by how many "
+                     "separate commits it took. The sort order — highest is the best "
+                     "redesign candidate.",
+            ),
+            "churn": st.column_config.NumberColumn(format="%d"),
+            "rework": st.column_config.NumberColumn(
+                format="%d",
+                help="Lines a single commit both added and removed. A file written "
+                     "once has churn but zero rework.",
+            ),
+            "rework/line": st.column_config.NumberColumn(
+                format="%.2f", help="Rework per surviving line."
+            ),
+            "share": st.column_config.ProgressColumn(
+                "share", format="percent", min_value=0.0,
+                max_value=float(table.share.max()) if len(table) else 1.0,
+                help="This file's churn as a fraction of the cluster's.",
+            ),
+            "lines": st.column_config.NumberColumn(
+                format="%d", help="Lines at HEAD. Blank means the file is gone."
+            ),
+            "churn/line": st.column_config.NumberColumn(
+                format="%.1f", help="Effective rewrites. 20 = replaced ~20 times over."
+            ),
+            "commits": st.column_config.NumberColumn(format="%d"),
+            "per commit": st.column_config.NumberColumn(
+                format="%d",
+                help="Churn per commit. Small = fiddly hotspot, many little edits. "
+                     "Large = rewritten in a few big drops.",
+            ),
+            "growth": st.column_config.NumberColumn(
+                format="%.2f",
+                help="(added - deleted) / churn. Near 0 means the file was rewritten "
+                     "in place, not grown — the same lines kept being replaced. "
+                     "+1 is pure addition, -1 pure deletion.",
+            ),
+            "outside": st.column_config.NumberColumn(
+                format="percent",
+                help="Share of this file's co-change weight going to files in OTHER "
+                     "clusters. High on a big file means the cluster boundary runs "
+                     "through it.",
+            ),
+            "top partner": st.column_config.TextColumn(
+                width="large", help="Most frequent co-change partner, and how many "
+                                    "commits they shared."
+            ),
+            "last": st.column_config.TextColumn(help="Most recent month touched."),
+        },
+    )
+    st.caption(
+        "Read it as: **growth** near 0 = rework not new code, **per commit** small = "
+        "a file people keep poking, **outside** high = this file belongs to a "
+        "different cluster than the algorithm put it in."
+    )
+
 elif screen == "detail":
     path = st.session_state.file_path
     row = files[files.path == path]
@@ -336,7 +613,8 @@ elif screen == "detail":
     cols[2].metric("Churn / commit", round(row.churn / max(1, row.commits)))
     cols[3].metric("Lines now", "gone" if gone else int(row.lines))
     # Effective rewrites: 20 means the file has been replaced ~20 times over.
-    cols[4].metric("Churn / line", "—" if gone else row.density)
+    cols[4].metric("Rework / line", "—" if gone else round(row.rework / row.lines, 2),
+                   delta=f"{int(row.rework):,} lines rewritten", delta_color="off")
     cols[5].metric("Last touched", row.last_month)
     if gone:
         st.caption(
@@ -346,6 +624,136 @@ elif screen == "detail":
 
     st.caption(f"+{int(row.added):,} / -{int(row.deleted):,} lines by month")
     st.bar_chart(monthly, color=[COOL, HOT])
+
+    st.subheader("Hot regions inside the file")
+    hunks = file_hunks(repo, path, since)
+    regions = churn.region_stats(hunks)
+    if regions.empty:
+        st.caption("No diff hunks for this path in the window.")
+    else:
+        unnamed = regions.loc[regions.region == churn.UNNAMED, "share"].sum()
+        top_region = regions.iloc[0]
+        st.caption(
+            f"`{top_region.region}` takes **{top_region.share:.0%}** of this file's "
+            f"churn across {int(top_region.commits)} commits."
+            + (f" {unnamed:.0%} of the churn is in hunks git could not name — usually "
+               "whole-file rewrites, or a format with no diff driver."
+               if unnamed >= 0.1 else "")
+        )
+        st.dataframe(
+            regions, hide_index=True, width="stretch",
+            column_config={
+                "region": st.column_config.TextColumn(
+                    width="medium",
+                    help="Function, method or declaration git names in the hunk header. "
+                         "Edits to the same symbol are grouped, so changing a signature "
+                         "does not split one method into two rows.",
+                ),
+                "churn": st.column_config.NumberColumn(format="%d"),
+                "share": st.column_config.ProgressColumn(
+                    "share", format="percent", min_value=0.0,
+                    max_value=float(regions.share.max()),
+                    help="This region's churn as a fraction of the file's.",
+                ),
+                "rework": st.column_config.NumberColumn(
+                    format="%d",
+                    help="Lines a hunk both added and removed — this region being "
+                         "rewritten rather than grown. The sort order.",
+                ),
+                "edits": st.column_config.NumberColumn(
+                    format="%d",
+                    help="Separate hunks touching this region. Many edits over few "
+                         "commits is one sweep; spread over many commits is pressure.",
+                ),
+                "commits": st.column_config.NumberColumn(format="%d"),
+                "growth": st.column_config.NumberColumn(
+                    format="%.2f",
+                    help="(added - deleted) / churn. Near 0 means the region was "
+                         "rewritten in place — the same lines replaced again and again.",
+                ),
+                "authors": st.column_config.NumberColumn(
+                    format="%d", help="Distinct people who edited this region."
+                ),
+                "owner": st.column_config.TextColumn(
+                    help="Whoever made the most edits here."
+                ),
+                "owner_share": st.column_config.NumberColumn(
+                    "owned", format="percent",
+                    help="Share of edits by that one person. Near 100% on a hot region "
+                         "is knowledge held in one head.",
+                ),
+                "last": st.column_config.TextColumn(help="Most recent month touched."),
+                "signature": st.column_config.TextColumn(
+                    width="large", help="Fullest signature line git reported."
+                ),
+            },
+        )
+        lonely = regions[(regions.owner_share >= 0.9) & (regions.share >= 0.05)]
+        if not lonely.empty:
+            who = ", ".join(f"`{r.region}` ({r.owner})" for r in lonely.head(3).itertuples())
+            st.caption(f"One person has made 90%+ of the edits to: {who}.")
+
+        pairs = churn.region_cochange(hunks)
+        if not pairs.empty:
+            st.markdown("##### Regions that change together")
+            st.caption(
+                "The repo-level co-change idea, one level down. Two methods always "
+                "edited in the same commit are one unit of behaviour under two names."
+            )
+            st.dataframe(
+                pairs.head(15), hide_index=True, width="stretch",
+                column_config={
+                    "region": st.column_config.TextColumn(width="medium"),
+                    "partner": st.column_config.TextColumn(width="medium"),
+                    "together": st.column_config.NumberColumn(
+                        format="%d", help="Commits touching both."
+                    ),
+                    "of the rarer": st.column_config.NumberColumn(
+                        format="percent",
+                        help="Those shared commits as a share of the less-touched "
+                             "region's own commits. 100% means it never moves alone.",
+                    ),
+                },
+            )
+
+        if not pd.isna(row.lines) and int(row.lines) >= 50:
+            st.markdown("##### Where in the file")
+            fine = line_bands(repo, path, since, int(row.lines))
+            bands = churn.merge_bands(fine)
+            if not bands.empty:
+                quiet = fine[fine.commits == 0]
+                fig = px.bar(
+                    bands, x="commits", y="band", orientation="h", color="commits",
+                    color_continuous_scale=SCALE,
+                    custom_data=["band", "commits", "last"],
+                )
+                fig.update_traces(hovertemplate=(
+                    "lines %{customdata[0]}<br>%{customdata[1]} commits"
+                    "<br>last %{customdata[2]}<extra></extra>"))
+                # Line 1 belongs at the top: the bar chart should read like the file.
+                fig.update_yaxes(autorange="reversed", title=None)
+                fig.update_layout(height=max(260, 22 * len(bands)), coloraxis_showscale=False,
+                                  margin=dict(t=10, l=0, r=0, b=0))
+                st.plotly_chart(fig, width="stretch")
+                st.caption(
+                    "Commits per slice of the file **as it stands today** — `git log -L` "
+                    "follows each range back through history, so a line that moved is "
+                    "still counted in the place it now lives. Works on any language, "
+                    "including the files no diff driver can name."
+                    + (f" {len(quiet)} of {len(fine)} slices "
+                       f"({int(quiet.end.sub(quiet.start).add(1).sum()):,} lines) went "
+                       "untouched all window." if not quiet.empty else "")
+                )
+                heat_source(repo, path, fine, int(row.lines))
+
+        projects = churn.ticket_projects(hunks.drop_duplicates("sha").subject)
+        if projects:
+            named = ", ".join(f"**{key}** ({n})" for key, n in list(projects.items())[:6])
+            st.caption(
+                f"Tracker projects landing here: {named}. Several projects hitting one "
+                "file is shared ownership — a design boundary that does not match how "
+                "the work is split."
+            )
 
     st.subheader("Changed together with")
     partners = (

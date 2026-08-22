@@ -20,7 +20,8 @@ def db_path():
 COLUMNS = (
     "path", "name", "analyzed_at", "since_months", "max_files",
     "total_churn", "total_commits", "num_files", "num_clusters",
-    "cross_module", "lines_now", "density", "top_module", "error",
+    "cross_module", "lines_now", "density", "rework", "rework_density",
+    "top_module", "error",
 )
 
 SCHEMA = """
@@ -37,11 +38,25 @@ CREATE TABLE IF NOT EXISTS repos (
   cross_module    INTEGER,
   lines_now       INTEGER,
   density         REAL,
+  rework          INTEGER,
+  rework_density  REAL,
   top_module      TEXT,
   error           TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
+
+# column -> declared type, read straight off SCHEMA so adding a column there is the
+# only edit needed. connect() backfills whatever an older database is missing.
+COLUMN_TYPES = {
+    parts[0]: parts[1]
+    for parts in (
+        line.strip().rstrip(",").split()
+        for line in SCHEMA.splitlines()
+        if line.startswith("  ")
+    )
+    if parts[0] in COLUMNS
+}
 
 
 def connect(path=None, same_thread=True):
@@ -53,6 +68,13 @@ def connect(path=None, same_thread=True):
     conn = sqlite3.connect(path or db_path(), check_same_thread=same_thread)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS leaves an older table alone, so a database written
+    # before a column existed would still be missing it -- and save_repo would fail on
+    # every write. Add what is missing instead of asking anyone to delete their data.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(repos)")}
+    for column, kind in COLUMN_TYPES.items():
+        if column not in have:
+            conn.execute(f"ALTER TABLE repos ADD COLUMN {column} {kind}")
     conn.commit()
     return conn
 
@@ -147,6 +169,25 @@ def demo():
         # Reopening the same file must see the saved rows — the whole point.
         conn = connect(db)
         assert load_repos(conn, ["/repos/a"]).total_churn.iat[0] == 250
+        conn.close()
+
+        # A database written before a column existed must gain it, not blow up on the
+        # next save. Drop one and reopen.
+        old = str(Path(tmp) / "old.db")
+        legacy = sqlite3.connect(old)
+        legacy.executescript(
+            "CREATE TABLE repos (path TEXT PRIMARY KEY, name TEXT, total_churn INTEGER);"
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);"
+            "INSERT INTO repos VALUES ('/repos/old', 'org/old', 7);"
+        )
+        legacy.commit()
+        legacy.close()
+        conn = connect(old)
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(repos)")}
+        assert set(COLUMNS) <= columns, set(COLUMNS) - columns
+        assert load_repos(conn, ["/repos/old"]).total_churn.iat[0] == 7
+        save_repo(conn, {**row, "path": "/repos/old", "rework": 12})
+        assert load_repos(conn, ["/repos/old"]).rework.iat[0] == 12
         conn.close()
     print("ok")
 

@@ -594,7 +594,10 @@ def cluster_stats(clusters, files, edges):
 
     # Share of the cluster's churn sitting in its single worst file. High means the
     # cluster is really one hotspot wearing a cluster's clothes.
-    top = by_cluster.churn.max() / by_cluster.churn.sum().replace(0, pd.NA)
+    # nan, not pd.NA: a cluster whose churn sums to zero would otherwise divide into
+    # an NAType, and NAType has no __round__ -- the whole screen raises rather than
+    # showing one blank cell.
+    top = by_cluster.churn.max() / by_cluster.churn.sum().replace(0, float("nan"))
 
     # Cohesion: of all co-change weight touching this cluster's files, how much stays
     # inside it. Edges are stored both ways, so anchoring on `a` counts each once.
@@ -792,6 +795,10 @@ def demo():
     # Row order follows the clusters frame, so table and treemap agree.
     assert list(cluster_stats(clusters, files, edges).cluster) == list(clusters.label)
     assert cluster_stats(pd.DataFrame(), files, edges).empty
+    # A cluster that churned zero lines must render a blank cell, not raise: NAType
+    # has no __round__, so dividing by a nullable zero takes the screen down.
+    idle = files.assign(churn=0, rework=0)
+    assert pd.isna(cluster_stats(clusters, idle, edges)["in hotspot"].iat[0])
 
     # file_stats: the table under the file treemap.
     fs = file_stats(files, edges, 0).set_index("file")

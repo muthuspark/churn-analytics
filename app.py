@@ -122,6 +122,27 @@ def tail_of(path, keep=2):
     return path if len(parts) <= keep else ".../" + "/".join(parts[-keep:])
 
 
+def picked_row(selection, name, guard):
+    """Position of a freshly clicked table row, or None.
+
+    A dataframe selection persists in session_state, so on arrival the destination's
+    own stale row fires again and bounces straight back where you came from. Act on
+    each selection once: `guard` identifies the page the click happened on, and
+    remembering the last one acted upon stops a revisit re-firing it.
+    """
+    rows = selection.get("selection", {}).get("rows") or []
+    token = (guard, tuple(rows))
+    seen = st.session_state.get(f"picked_{name}")
+    # Record every change, the empty one included. Clicking a selected row deselects it
+    # and clicking again re-selects it, so without the empty step in between the second
+    # click matches the token from the first and the row can never be opened twice.
+    st.session_state[f"picked_{name}"] = token
+    return None if not rows or seen == token else rows[0]
+
+
+CLICK_HINT = "Click any row to open it."
+
+
 def goto(screen, **kwargs):
     st.session_state.screen = screen
     st.session_state.update(kwargs)
@@ -291,11 +312,12 @@ if screen == "portfolio":
         "total_commits": "commits", "num_clusters": "clusters",
         "cross_module": "cross-module", "analyzed_at": "analyzed",
         "rework_density": "rework/line"}).sort_values("rework", ascending=False)
-    st.dataframe(
+    picked = st.dataframe(
         shown[["project", "rework", "rework/line", "churn", "density", "files",
                "commits", "clusters", "cross-module", "top_module", "analyzed"]
               + (["error"] if shown.error.notna().any() else [])],
         hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-row", key="portfolio_tbl",
         column_config={
             "rework": st.column_config.NumberColumn(
                 format="%d",
@@ -307,6 +329,11 @@ if screen == "portfolio":
             ),
         },
     )
+    st.caption(CLICK_HINT)
+    hit = picked_row(picked, "portfolio_tbl", tuple(repo_paths))
+    if hit is not None:
+        goto("clusters", repo_path=shown.path.iat[hit],
+             cluster_id=None, file_path=None)
     st.stop()
 
 if not repo:
@@ -412,8 +439,9 @@ if screen == "clusters":
 
     st.markdown("##### Clusters")
     table = churn.cluster_stats(shown, files, edges)
-    st.dataframe(
+    picked = st.dataframe(
         table, hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-row", key="clusters_tbl",
         column_config={
             "cluster": st.column_config.TextColumn(width="medium"),
             "modules": st.column_config.TextColumn(
@@ -458,9 +486,13 @@ if screen == "clusters":
             "last": st.column_config.TextColumn(help="Most recent month touched."),
         },
     )
+    hit = picked_row(picked, "clusters_tbl", repo)
+    if hit is not None:
+        goto("files", cluster_id=int(
+            clusters.loc[clusters.label == table.cluster.iat[hit], "cluster_id"].iat[0]))
     st.caption(
-        "Read it as: **share** = how much of the repo, **churn/line** = how much "
-        "rework, **cohesion** = whether the cluster is a real boundary, "
+        f"{CLICK_HINT} Read it as: **share** = how much of the repo, **churn/line** = "
+        "how much rework, **cohesion** = whether the cluster is a real boundary, "
         "**in hotspot** = whether it is really just one file."
     )
 
@@ -532,8 +564,9 @@ elif screen == "files":
             "them — no size to draw — but their churn is real, so they are listed here "
             "with a blank per-line figure."
         )
-    st.dataframe(
+    picked = st.dataframe(
         table, hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-row", key=f"files_tbl_{cluster_id}",
         column_config={
             "file": st.column_config.TextColumn(width="large"),
             "debt": st.column_config.NumberColumn(
@@ -587,10 +620,13 @@ elif screen == "files":
             "last": st.column_config.TextColumn(help="Most recent month touched."),
         },
     )
+    hit = picked_row(picked, "files_tbl", cluster_id)
+    if hit is not None:
+        goto("detail", file_path=table.file.iat[hit])
     st.caption(
-        "Read it as: **growth** near 0 = rework not new code, **per commit** small = "
-        "a file people keep poking, **outside** high = this file belongs to a "
-        "different cluster than the algorithm put it in."
+        f"{CLICK_HINT} Read it as: **growth** near 0 = rework not new code, "
+        "**per commit** small = a file people keep poking, **outside** high = this "
+        "file belongs to a different cluster than the algorithm put it in."
     )
 
 elif screen == "detail":
@@ -777,14 +813,9 @@ elif screen == "detail":
             shown_partners, hide_index=True, width="stretch",
             on_select="rerun", selection_mode="single-row", key=f"partners_{path}",
         )
-        # A dataframe selection persists, so on arrival the destination's own stale
-        # row would fire again and bounce straight back. Act on each selection once:
-        # per-path keys stop the first bounce, the token stops a revisit re-firing.
-        rows = picked.get("selection", {}).get("rows") or []
-        token = (path, tuple(rows))
-        if rows and st.session_state.get("partner_token") != token:
-            st.session_state.partner_token = token
-            jump = partners.iloc[rows[0]]
+        hit = picked_row(picked, "partners", path)
+        if hit is not None:
+            jump = partners.iloc[hit]
             goto("detail", file_path=jump.b, cluster_id=int(jump.cluster_id))
 
     st.subheader(f"Commits ({len(history)})")

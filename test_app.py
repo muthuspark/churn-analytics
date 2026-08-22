@@ -73,6 +73,49 @@ def main(repo, other):
     table = at2.dataframe[0].value
     assert (table["churn"].notna()).sum() >= 2, table[["project", "churn"]]
 
+    # --- the same three hops, driven by the TABLES rather than the treemaps -------
+    # Every table that names a project, cluster or file navigates the same way the
+    # treemap above it does; the row order is the table's, not the frame it came from.
+    at = start([repo, bad, other])
+    at.session_state["portfolio_tbl"] = {"selection": {"rows": [0]}}
+    at.run()
+    assert not at.exception, at.exception
+    assert at.session_state["screen"] == "clusters", at.session_state["screen"]
+    picked_repo = at.session_state["repo_path"]
+    assert picked_repo in (repo, other), picked_repo
+
+    at.session_state["clusters_tbl"] = {"selection": {"rows": [0]}}
+    at.run()
+    assert not at.exception, at.exception
+    assert at.session_state["screen"] == "files", at.session_state["screen"]
+    landed = at.session_state["cluster_id"]
+
+    files_table = next(d.value for d in at.dataframe if "rework/line" in d.value.columns)
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"rows": [1]}}
+    at.run()
+    assert not at.exception, at.exception
+    assert at.session_state["screen"] == "detail", at.session_state["screen"]
+    assert at.session_state["file_path"] == files_table.file.iat[1], (
+        at.session_state["file_path"], files_table.file.iat[1])
+
+    # A selection persists, so the destination's own stale row must not fire and bounce
+    # us straight back out of the page we just landed on.
+    at.run()
+    assert at.session_state["screen"] == "detail", at.session_state["screen"]
+
+    # Going back must not re-fire the row that is still selected there...
+    at.session_state["screen"] = "files"
+    at.run()
+    assert at.session_state["screen"] == "files", at.session_state["screen"]
+    # ...but the same row must still be openable a second time. Clicking a selected row
+    # deselects it first, and that empty step is what makes the next click count.
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"rows": []}}
+    at.run()
+    assert at.session_state["screen"] == "files", at.session_state["screen"]
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"rows": [1]}}
+    at.run()
+    assert at.session_state["screen"] == "detail", at.session_state["screen"]
+
     # --- drill down from the portfolio -------------------------------------------
     at = start([repo, bad, other])
     at.session_state["portfolio_tm"] = {

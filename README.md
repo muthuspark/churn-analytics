@@ -136,6 +136,14 @@ Louvain runs with a fixed seed, so the same input gives the same output — but 
 | `churn.py` | the pipeline — git parsing, co-change graph, clustering, density. No streamlit import, so it's usable on its own. |
 | `app.py` | the Streamlit UI and navigation |
 | `test_app.py` | navigation checks via `streamlit.testing.v1.AppTest` |
+| `.streamlit/config.toml` | theme |
+| `static/` | theme fonts, with their OFL licences |
+
+## Theme
+
+The **editorial** theme from [awesome-streamlit-themes](https://github.com/jmedia65/awesome-streamlit-themes/tree/main/editorial) — Playfair Display headings, Lora body, Source Code Pro for code, on white. Fonts are served locally from `static/` (hence `enableStaticServing = true`), so there's no CDN dependency and the app works offline.
+
+The chart palette in `app.py` (`HOT`, `COOL`, `PAPER`, `SCALE`) is tuned to match it. If you swap the theme, those four constants are the only things to revisit.
 
 ## Using the pipeline directly
 

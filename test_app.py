@@ -6,6 +6,7 @@ previous repo or date window can still be sitting there on the next run.
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -28,7 +29,13 @@ def main(repo):
 
     at = AppTest.from_file(APP, default_timeout=300).run()
     assert not at.exception, at.exception
-    assert at.error, "default repo '.' is not a git repo, expected a git error"
+
+    # A path that is definitely not a repo must surface git's message, not raise.
+    # (Don't lean on the default "." — this project is itself a git repo.)
+    with tempfile.TemporaryDirectory() as not_a_repo:
+        at.text_input[0].set_value(not_a_repo).run()
+        assert not at.exception, at.exception
+        assert at.error, "expected a git error for a non-repo path"
 
     at.text_input[0].set_value(repo)
     at.button[0].click().run()

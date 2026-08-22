@@ -10,6 +10,14 @@ import churn
 
 st.set_page_config(page_title="Churn clusters", layout="wide")
 
+# Chart palette, kept in step with .streamlit/config.toml (editorial theme).
+HOT = "#c41e3a"      # theme primaryColor
+COOL = "#c9c9c9"     # light enough that plotly picks dark label text
+PAPER = "#ffffff"    # plotly wraps top-level boxes in a dark virtual root
+# The darkest two OrRd steps are near-black, and a global theme font colour stops
+# plotly from flipping label text to white on them. Drop them.
+SCALE = px.colors.sequential.OrRd[:-2]
+
 st.session_state.setdefault("screen", "clusters")
 st.session_state.setdefault("cluster_id", None)
 st.session_state.setdefault("file_path", None)
@@ -108,13 +116,18 @@ if screen == "clusters":
         # Modules spanned, not file count: area already shows size, so spend the color
         # channel on the thing you'd act on. 1 = contained, higher = coupling to chase.
         color="num_modules",
-        color_continuous_scale="OrRd",
+        color_continuous_scale=SCALE,
         range_color=(1, max(2, int(shown.num_modules.max()))),
         custom_data=["total_commits", "num_modules", "num_files"],
     )
     fig.update_traces(
         hovertemplate="%{label}<br>churn %{value}<br>%{customdata[0]} commits"
-        "<br>%{customdata[2]} files across %{customdata[1]} module(s)<extra></extra>"
+        "<br>%{customdata[2]} files across %{customdata[1]} module(s)<extra></extra>",
+        # Plotly wraps top-level boxes in a virtual root and paints its header dark;
+        # on a light theme that reads as a stray band. It has no data row, so the
+        # colour has to be set here rather than through the colour mapping.
+        root=dict(color=PAPER),
+        pathbar_visible=False,  # the app's own breadcrumb row does this job
     )
     fig.update_coloraxes(colorbar_title_text="modules")
     fig.update_layout(height=560, margin=dict(t=30, l=0, r=0, b=0))
@@ -143,13 +156,15 @@ elif screen == "files":
         path=["path"],
         values=metric,
         color="hot",
-        color_discrete_map={"hot": "#d1495b", "normal": "#8d99ae", "(?)": "#e9ecef"},
+        color_discrete_map={"hot": HOT, "normal": COOL, "(?)": PAPER},
         custom_data=["commits", "churn", "lines_txt"],
     )
     fig.update_traces(
         hovertemplate="%{label}<br>" + metric + " %{value}"
         "<br>churn %{customdata[1]} · lines %{customdata[2]}"
-        "<br>%{customdata[0]} commits<extra></extra>"
+        "<br>%{customdata[0]} commits<extra></extra>",
+        root=dict(color=PAPER),
+        pathbar_visible=False,
     )
     fig.update_layout(height=560, margin=dict(t=30, l=0, r=0, b=0))
     st.plotly_chart(fig, on_select="rerun", key="files_tm", width="stretch")
@@ -186,7 +201,7 @@ elif screen == "detail":
         )
 
     st.caption(f"+{int(row.added):,} / -{int(row.deleted):,} lines by month")
-    st.bar_chart(monthly, color=["#8d99ae", "#d1495b"])
+    st.bar_chart(monthly, color=[COOL, HOT])
 
     st.subheader("Changed together with")
     partners = (

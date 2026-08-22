@@ -314,10 +314,12 @@ if screen == "portfolio":
         "name": "project", "total_churn": "churn", "num_files": "files",
         "total_commits": "commits", "num_clusters": "clusters",
         "cross_module": "cross-module", "analyzed_at": "analyzed",
-        "rework_density": "rework/line"}).sort_values("rework", ascending=False)
+        "rework_density": "rework/line", "lines_now": "lines"}).sort_values(
+            "rework", ascending=False)
     picked = st.dataframe(
-        shown[["project", "rework", "rework/line", "churn", "density", "files",
-               "commits", "clusters", "cross-module", "top_module", "analyzed"]
+        shown[["project", "rework", "rework/line", "lines", "churn", "density",
+               "files", "commits", "clusters", "cross-module", "top_module",
+               "analyzed"]
               + (["error"] if shown.error.notna().any() else [])],
         hide_index=True, width="stretch",
         on_select="rerun", selection_mode="single-cell", key="portfolio_tbl",
@@ -329,6 +331,12 @@ if screen == "portfolio":
             ),
             "rework/line": st.column_config.NumberColumn(
                 format="%.2f", help="Rework per surviving line."
+            ),
+            "lines": st.column_config.NumberColumn(
+                format="%d",
+                help="Lines at HEAD across the files touched in the window. A high "
+                     "rework/line on a tiny codebase is one volatile file, not a "
+                     "portfolio signal — read the two together.",
             ),
         },
     )

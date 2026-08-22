@@ -4,7 +4,9 @@ Find the files in a git repo that **change together**, and drill into why.
 
 Raw churn (lines added + deleted) tells you which files are big and noisy. It doesn't tell you which files are *coupled* — the ones where touching A always means touching B, D and F. That coupling is what makes changes expensive, and it doesn't show up in any per-file metric.
 
-This tool builds a co-change graph from `git log`, runs community detection over it, and gives you three screens: **clusters → files → per-file report**.
+This tool builds a co-change graph from `git log`, runs community detection over it, and gives you four screens: **projects → clusters → files → per-file report**.
+
+Point it at a list of local repos and it ranks which project is churning most, then lets you drill all the way down to a single file's commit history. Results are persisted to SQLite, so they survive restarts.
 
 All screenshots below are [FastAPI](https://github.com/fastapi/fastapi) over a 24-month window — 16,032 file-commit rows across 3,760 files.
 
@@ -26,7 +28,17 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/streamlit run app.py
 ```
 
-Opens on <http://localhost:8501>. Put an absolute path to any local git repo in the sidebar and press Enter. Read-only — it never writes to the repo you point it at.
+Opens on <http://localhost:8501>. Paste the absolute paths of the repos you care about into **Repo paths** (one per line) and press **Analyze all**. Read-only — it never writes to the repos you point it at.
+
+The path list, window and exclude globs are saved to `churn.db`, so you paste them once.
+
+## The four screens
+
+```
+projects  ->  clusters  ->  files  ->  detail
+```
+
+**Projects** ranks your repos: box area is total churn, colour is churn-per-line, and clicking a project drills into it. Dormant repos and bad paths appear in the table with the git error rather than silently disappearing.
 
 ## How it works
 
@@ -37,7 +49,22 @@ Opens on <http://localhost:8501>. Put an absolute path to any local git repo in 
 
 Two git calls total, regardless of repo size, and the result is cached with `st.cache_data`.
 
-## The three screens
+### Persistence
+
+One summary row per repo in `churn.db` (SQLite, stdlib `sqlite3`), replaced when that
+repo is re-analysed. There is deliberately **no history** — no run log, no trends. If a
+repo is dormant or its path is wrong, the row records the git error and stays visible
+rather than vanishing, and one bad path never stops the other 59.
+
+Clusters, files and commits are **not** persisted. Drilling into a project recomputes
+that repo live (a second or two) and caches it for the session, which keeps the database
+tiny.
+
+Analysing 54 local repos over a 12-month window took **33 seconds**.
+
+## Per-repo screens
+
+Everything below the projects list works on one repo at a time.
 
 ### 1. Clusters
 
@@ -133,7 +160,8 @@ Louvain runs with a fixed seed, so the same input gives the same output — but 
 
 | File | What's in it |
 |---|---|
-| `churn.py` | the pipeline — git parsing, co-change graph, clustering, density. No streamlit import, so it's usable on its own. |
+| `churn.py` | the pipeline — git parsing, co-change graph, clustering, density, `summarise()`. No streamlit import, so it's usable on its own. |
+| `store.py` | SQLite persistence for the project rows and saved settings. No streamlit import either. |
 | `app.py` | the Streamlit UI and navigation |
 | `test_app.py` | navigation checks via `streamlit.testing.v1.AppTest` |
 | `.streamlit/config.toml` | theme |
@@ -177,15 +205,17 @@ Returns four dataframes:
 ## Checks
 
 ```bash
-.venv/bin/python churn.py                    # pipeline self-check
-.venv/bin/python test_app.py /path/to/repo   # UI navigation check
+.venv/bin/python churn.py                            # pipeline self-check
+.venv/bin/python store.py                            # persistence self-check
+.venv/bin/python test_app.py /path/to/repo /another   # UI + persistence check
 ```
 
-Both print `ok`.
+All three print `ok`. `test_app.py` uses a temp database via `CHURN_DB`, so it never
+touches your real `churn.db`.
 
 ## Known limits
 
 - **Renames split history.** Git's rename notation is normalised to the post-rename path, but churn before and after a rename lands on two separate nodes. Fixing it properly needs `git log --follow` per path — one git call per file.
 - **Churn is a proxy, not a verdict.** A file with high churn may be under active healthy development. The tool surfaces candidates; you still have to look.
 - **No line-level detail.** `--numstat` gives per-file counts only, so there's no honest way to show *where* inside a file the changes concentrate. Churn over time plus the commit list is the substitute.
-- **Editing `churn.py` while the app runs** won't invalidate `st.cache_data` — it hashes the decorated function, not the callee. Restart the server after pipeline changes.
+- **Editing `churn.py` or `store.py` while the app runs needs a server restart.** Streamlit hot-reloads `app.py` only; imported modules stay as they were at process start, and `st.cache_data` hashes the decorated function rather than the callee.

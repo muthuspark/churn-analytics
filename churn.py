@@ -192,6 +192,30 @@ def analyze(repo, since, max_files_per_commit, patterns=EXCLUDE):
     )
 
 
+def summarise(clusters, files, commits):
+    """Reduce one repo's analysis to the portfolio row. Pure — no git access."""
+    real = clusters[clusters.cluster_id != -1] if not clusters.empty else clusters
+    live = files[files.lines.notna()]
+    lines_now = int(live.lines.sum())
+    top_module = None
+    if not real.empty:
+        top_module = real.groupby("dominant_module").total_churn.sum().idxmax()
+    return {
+        "total_churn": int(files.churn.sum()),
+        # From commits, not files.commits: a commit touching three files shows up in
+        # three file rows, so summing that column multiplies every commit by its fan-out.
+        "total_commits": int(commits.sha.nunique()),
+        "num_files": len(files),
+        "num_clusters": len(real),
+        "cross_module": int((real.num_modules > 1).sum()) if not real.empty else 0,
+        "lines_now": lines_now,
+        # Live files on both sides. Dividing *total* churn by HEAD lines would count
+        # deleted files in the numerator only, inflating every repo.
+        "density": round(live.churn.sum() / lines_now, 2) if lines_now else None,
+        "top_module": top_module,
+    }
+
+
 def demo():
     log = (
         f"{COMMIT_MARK}aaa\t2026-01-05T10:00:00+00:00\tadd users\n"
@@ -236,6 +260,32 @@ def demo():
     assert resolve_rename("old.py => new.py") == "new.py"
     assert resolve_rename("plain.py") == "plain.py"
     assert excluded("web/node_modules/x.js") and not excluded("web/app.js")
+
+    # summarise: build the frames analyze() would produce from this fixture.
+    files = df.groupby("path").agg(
+        churn=("churn", "sum"), commits=("sha", "nunique")
+    ).reset_index()
+    files["cluster_id"] = files.path.map(assignment)
+    files["lines"] = files.path.map({"api/users.py": 100, "api/schema.py": 50})
+    clusters = pd.DataFrame([
+        {"cluster_id": 0, "total_churn": 22, "dominant_module": "api", "num_modules": 2},
+        {"cluster_id": -1, "total_churn": 7, "dominant_module": "web", "num_modules": 1},
+    ])
+    s = summarise(clusters, files, df)
+    # Three commits, not 5. Summing files.commits would give 5, because commits aaa and
+    # bbb each touch two files.
+    assert files.commits.sum() == 5, files.commits.sum()
+    assert s["total_commits"] == 3, s["total_commits"]
+    assert s["total_churn"] == 30, s["total_churn"]      # includes web/app.js
+    assert s["lines_now"] == 150, s["lines_now"]          # web/app.js has no lines
+    assert s["num_clusters"] == 1 and s["cross_module"] == 1, s
+    assert s["top_module"] == "api", s["top_module"]
+    # Live churn (23) over live lines (150), not total churn (30) over 150.
+    assert s["density"] == round(23 / 150, 2), s["density"]
+
+    gone = files.assign(lines=float("nan"))
+    assert summarise(clusters, gone, df)["density"] is None
+    assert summarise(pd.DataFrame(), files, df)["top_module"] is None
     print("ok")
 
 

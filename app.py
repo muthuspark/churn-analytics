@@ -1,12 +1,15 @@
-"""Churn cluster treemap: cluster treemap -> file treemap -> per-file detail."""
+"""Churn explorer: portfolio -> cluster treemap -> file treemap -> per-file detail."""
 
 import subprocess
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 import churn
+import store
 
 st.set_page_config(page_title="Churn clusters", layout="wide")
 
@@ -17,14 +20,28 @@ COOL = "#c9c9c9"     # light enough that plotly picks dark label text
 # plotly from flipping label text to white on them. Drop them.
 SCALE = px.colors.sequential.OrRd[:-2]
 
-st.session_state.setdefault("screen", "clusters")
+st.session_state.setdefault("screen", "portfolio")
+st.session_state.setdefault("repo_path", None)
 st.session_state.setdefault("cluster_id", None)
 st.session_state.setdefault("file_path", None)
+
+
+@st.cache_resource
+def db():
+    """One connection for the app. check_same_thread=False because Streamlit reruns
+    the script on a different thread than the one that opened it."""
+    return store.connect(same_thread=False)
 
 
 @st.cache_data(show_spinner="Analyzing repo...")
 def analyze(repo, since, max_files_per_commit, patterns):
     return churn.analyze(repo, since, max_files_per_commit, patterns)
+
+
+def repo_name(path):
+    """Last two segments, so sibling projects stay distinguishable."""
+    parts = Path(path).parts[-2:]
+    return "/".join(parts) if parts else path
 
 
 def goto(screen, **kwargs):
@@ -62,25 +79,32 @@ def clicked_label(key, known):
     return None
 
 
+conn = db()
+saved = lambda key, default: store.get_setting(conn, key, default)
+
 with st.sidebar:
-    repo = st.text_input("Repo path", value=".")
+    paths_text = st.text_area(
+        "Repo paths", value=saved("paths", ""), height=160,
+        help="One absolute path per line. Saved to churn.db, so paste them once.",
+    )
+    repo_paths = [p.strip() for p in paths_text.splitlines() if p.strip()]
     months = st.number_input(
-        "Months of history", 1, 24, 12,
+        "Months of history", 1, 24, int(saved("months", 12)),
         help="How far back to read git log.",
     )
     since = f"{int(months)} months ago"
     max_files = st.number_input(
-        "Max files per commit", 2, 500, 30,
+        "Max files per commit", 2, 500, int(saved("max_files", 30)),
         help="Commits touching more files are ignored when building the co-change graph.",
     )
     excludes = st.text_area(
-        "Exclude globs", value="\n".join(churn.EXCLUDE), height=140,
+        "Exclude globs", value=saved("excludes", "\n".join(churn.EXCLUDE)), height=140,
         help="Generated files and lockfiles. They dominate churn and fake cross-module coupling.",
     )
     # Render-time only: not analyze() arguments, so moving these does not bust the cache.
     hot_pct = st.slider("Highlight top % churn", 1, 100, 20)
     size_by = st.radio(
-        "Size files by", ["churn", "churn / line"], horizontal=True,
+        "Size by", ["churn", "churn / line"], horizontal=True,
         help=(
             "- **churn** — *where did our effort actually go?* Honest about time "
             "spent. Use it to orient on a new repo.\n"
@@ -96,15 +120,95 @@ with st.sidebar:
         help="Files that never co-changed inside the commit-size cap. Usually most of "
              "the repo, so they crowd out the real clusters.",
     )
-    analyzed = st.button("Analyze", type="primary")
+    analyze_all = st.button("Analyze all", type="primary")
 
-if analyzed:
-    # Louvain renumbers clusters on every run, so a surviving cluster_id would point
-    # at an unrelated cluster. Drop the drill-down state rather than mislabel it.
-    st.session_state.update(screen="clusters", cluster_id=None, file_path=None)
+patterns = tuple(line.strip() for line in excludes.splitlines() if line.strip())
+for key, value in [
+    ("paths", paths_text), ("months", int(months)),
+    ("max_files", int(max_files)), ("excludes", excludes),
+]:
+    if saved(key, None) != str(value):
+        store.set_setting(conn, key, value)
+
+
+def analyze_one(path):
+    """Analyse one repo and persist its summary row. Never raises: a bad path among 60
+    must cost that row, not the whole run."""
+    row = {"path": path, "name": repo_name(path),
+           "analyzed_at": datetime.now().isoformat(timespec="seconds"),
+           "since_months": int(months), "max_files": int(max_files)}
+    try:
+        clusters, files, commits, _ = analyze(path, since, int(max_files), patterns)
+        if clusters.empty:
+            row["error"] = "no commits in window"
+        else:
+            row.update(churn.summarise(clusters, files, commits))
+    except subprocess.CalledProcessError as exc:
+        row["error"] = (exc.stderr or "git failed").strip().splitlines()[-1]
+    except OSError as exc:
+        row["error"] = str(exc)
+    store.save_repo(conn, row)
+
+
+if analyze_all and repo_paths:
+    bar = st.progress(0.0)
+    for i, path in enumerate(repo_paths, 1):
+        bar.progress((i - 1) / len(repo_paths), text=f"{i}/{len(repo_paths)} {repo_name(path)}")
+        analyze_one(path)
+    bar.empty()
+    goto("portfolio")
+
+screen = st.session_state.screen
+repo = st.session_state.repo_path
+
+if screen == "portfolio":
+    st.subheader("Projects")
+    if not repo_paths:
+        st.info("Paste repo paths in the sidebar — one absolute path per line — then Analyze all.")
+        st.stop()
+    portfolio = store.load_repos(conn, repo_paths)
+    done = portfolio[portfolio.total_churn.notna()]
+    if done.empty:
+        st.info(f"{len(repo_paths)} repo(s) listed, none analysed yet. Press Analyze all.")
+    else:
+        metric = "total_churn" if size_by == "churn" else "density"
+        ranked = done[done[metric].notna()].assign(
+            hover=lambda d: d.apply(
+                lambda r: f"{r['name']}<br>churn {int(r.total_churn):,}"
+                f"<br>density {r.density}<br>{int(r.num_files)} files"
+                f" · {int(r.total_commits)} commits", axis=1)
+        )
+        fig = px.treemap(
+            ranked, path=[px.Constant("projects"), "name"], values=metric,
+            color="density", color_continuous_scale=SCALE, custom_data=["hover"],
+        )
+        fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>",
+                          pathbar_visible=False)
+        set_root_hover(fig, f"{len(ranked)} projects<br>churn "
+                            f"{int(ranked.total_churn.sum()):,}")
+        fig.update_coloraxes(colorbar_title_text="churn/line")
+        fig.update_layout(height=520, margin=dict(t=30, l=0, r=0, b=0))
+        st.plotly_chart(fig, on_select="rerun", key="portfolio_tm", width="stretch")
+        picked = clicked_label("portfolio_tm", set(ranked.name))
+        if picked:
+            goto("clusters", repo_path=ranked.loc[ranked.name == picked, "path"].iat[0],
+                 cluster_id=None, file_path=None)
+
+    shown = portfolio.rename(columns={
+        "name": "project", "total_churn": "churn", "num_files": "files",
+        "total_commits": "commits", "num_clusters": "clusters",
+        "cross_module": "cross-module", "analyzed_at": "analyzed"})
+    st.dataframe(
+        shown[["project", "churn", "density", "files", "commits", "clusters",
+               "cross-module", "top_module", "analyzed", "error"]],
+        hide_index=True, width="stretch",
+    )
+    st.stop()
+
+if not repo:
+    goto("portfolio")
 
 try:
-    patterns = tuple(line.strip() for line in excludes.splitlines() if line.strip())
     clusters, files, commits, edges = analyze(repo, since, int(max_files), patterns)
 except subprocess.CalledProcessError as exc:
     st.error(f"git log failed for `{repo}`:\n\n```\n{exc.stderr.strip()}\n```")
@@ -114,7 +218,6 @@ if clusters.empty:
     st.info("No commits found. Check the repo path and the 'since' window.")
     st.stop()
 
-screen = st.session_state.screen
 cluster_id = st.session_state.cluster_id
 cluster_row = clusters[clusters.cluster_id == cluster_id]
 cluster_label = cluster_row.label.iat[0] if len(cluster_row) else None
@@ -122,12 +225,14 @@ if screen != "clusters" and cluster_label is None:
     goto("clusters")  # cluster ids are not stable across re-analysis
 
 crumbs = st.columns(4)
-if crumbs[0].button("repo", disabled=screen == "clusters"):
+if crumbs[0].button("projects"):
+    goto("portfolio")
+if crumbs[1].button(repo_name(repo), disabled=screen == "clusters"):
     goto("clusters")
-if cluster_label and crumbs[1].button(cluster_label, disabled=screen == "files"):
+if cluster_label and crumbs[2].button(cluster_label, disabled=screen == "files"):
     goto("files")
 if screen == "detail":
-    crumbs[2].markdown(f"**{st.session_state.file_path}**")
+    crumbs[3].markdown(f"**{st.session_state.file_path}**")
 
 if screen == "clusters":
     shown = clusters if show_unclustered else clusters[clusters.cluster_id != -1]
@@ -142,7 +247,7 @@ if screen == "clusters":
     )
     fig = px.treemap(
         shown,
-        path=[px.Constant("repo"), "label"],
+        path=[px.Constant(repo_name(repo)), "label"],
         values="total_churn",
         # Modules spanned, not file count: area already shows size, so spend the color
         # channel on the thing you'd act on. 1 = contained, higher = coupling to chase.

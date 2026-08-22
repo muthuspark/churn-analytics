@@ -93,12 +93,17 @@ def main(repo, other):
     assert not at.exception, at.exception
     assert at.session_state["screen"] == "detail"
     assert len(at.metric) == 6
-    # Partner table drives navigation, so it must render with the commit list.
-    assert len(at.dataframe) == 2, len(at.dataframe)
+    # Regions, region pairs, partners, commits. Find each by its columns rather than by
+    # position, so adding another table above them does not silently retarget this test.
+    assert len(at.dataframe) >= 3, len(at.dataframe)
+    partners = next(d for d in at.dataframe if "commits together" in d.value.columns)
+    regions = next(d for d in at.dataframe if "signature" in d.value.columns)
+    assert not regions.value.empty and regions.value.share.iat[0] > 0, regions.value
+    assert regions.value.owner_share.between(0, 1).all(), regions.value.owner_share
 
     # Clicking a co-change partner navigates there and STAYS: a dataframe selection
     # persists, so a naive handler bounces back and forth forever.
-    partner = at.dataframe[0].value.iloc[0]["file"]
+    partner = partners.value.iloc[0]["file"]
     at.session_state[f"partners_{top_file}"] = {"selection": {"rows": [0]}}
     at.run()
     assert not at.exception, at.exception

@@ -77,21 +77,21 @@ def main(repo, other):
     # Every table that names a project, cluster or file navigates the same way the
     # treemap above it does; the row order is the table's, not the frame it came from.
     at = start([repo, bad, other])
-    at.session_state["portfolio_tbl"] = {"selection": {"rows": [0]}}
+    at.session_state["portfolio_tbl"] = {"selection": {"cells": [[0, "project"]]}}
     at.run()
     assert not at.exception, at.exception
     assert at.session_state["screen"] == "clusters", at.session_state["screen"]
     picked_repo = at.session_state["repo_path"]
     assert picked_repo in (repo, other), picked_repo
 
-    at.session_state["clusters_tbl"] = {"selection": {"rows": [0]}}
+    at.session_state["clusters_tbl"] = {"selection": {"cells": [[0, "cluster"]]}}
     at.run()
     assert not at.exception, at.exception
     assert at.session_state["screen"] == "files", at.session_state["screen"]
     landed = at.session_state["cluster_id"]
 
     files_table = next(d.value for d in at.dataframe if "rework/line" in d.value.columns)
-    at.session_state["files_tbl_%d" % landed] = {"selection": {"rows": [1]}}
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"cells": [[1, "file"]]}}
     at.run()
     assert not at.exception, at.exception
     assert at.session_state["screen"] == "detail", at.session_state["screen"]
@@ -109,12 +109,19 @@ def main(repo, other):
     assert at.session_state["screen"] == "files", at.session_state["screen"]
     # ...but the same row must still be openable a second time. Clicking a selected row
     # deselects it first, and that empty step is what makes the next click count.
-    at.session_state["files_tbl_%d" % landed] = {"selection": {"rows": []}}
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"cells": []}}
     at.run()
     assert at.session_state["screen"] == "files", at.session_state["screen"]
-    at.session_state["files_tbl_%d" % landed] = {"selection": {"rows": [1]}}
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"cells": [[1, "file"]]}}
     at.run()
     assert at.session_state["screen"] == "detail", at.session_state["screen"]
+
+    # Clicking a number is just selecting a number. Only the name column navigates.
+    at.session_state["screen"] = "files"
+    at.run()
+    at.session_state["files_tbl_%d" % landed] = {"selection": {"cells": [[3, "churn"]]}}
+    at.run()
+    assert at.session_state["screen"] == "files", at.session_state["screen"]
 
     # --- drill down from the portfolio -------------------------------------------
     at = start([repo, bad, other])
@@ -147,7 +154,7 @@ def main(repo, other):
     # Clicking a co-change partner navigates there and STAYS: a dataframe selection
     # persists, so a naive handler bounces back and forth forever.
     partner = partners.value.iloc[0]["file"]
-    at.session_state[f"partners_{top_file}"] = {"selection": {"rows": [0]}}
+    at.session_state[f"partners_{top_file}"] = {"selection": {"cells": [[0, "file"]]}}
     at.run()
     assert not at.exception, at.exception
     assert at.session_state["file_path"] == partner, at.session_state["file_path"]

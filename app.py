@@ -122,25 +122,28 @@ def tail_of(path, keep=2):
     return path if len(parts) <= keep else ".../" + "/".join(parts[-keep:])
 
 
-def picked_row(selection, name, guard):
-    """Position of a freshly clicked table row, or None.
+def picked_row(selection, name, guard, column):
+    """Row position of a freshly clicked cell in `column`, or None.
 
-    A dataframe selection persists in session_state, so on arrival the destination's
-    own stale row fires again and bounces straight back where you came from. Act on
-    each selection once: `guard` identifies the page the click happened on, and
-    remembering the last one acted upon stops a revisit re-firing it.
+    Cell selection rather than row selection, because row selection makes Streamlit
+    draw a checkbox down the left edge -- `rowMarkers: checkbox` is hardcoded in the
+    grid and painted on a canvas, so neither a column config nor CSS can touch it.
+    Selecting cells needs no marker, and it says which column was hit, so only the
+    name column navigates and the numbers stay ordinary selectable cells.
+
+    Positions are the frame's own, not the browser's sort order, so .iat is safe here.
     """
-    rows = selection.get("selection", {}).get("rows") or []
-    token = (guard, tuple(rows))
+    cells = selection.get("selection", {}).get("cells") or []
+    token = (guard, tuple(map(tuple, cells)))
     seen = st.session_state.get(f"picked_{name}")
-    # Record every change, the empty one included. Clicking a selected row deselects it
+    # Record every change, the empty one included. Clicking a selected cell deselects it
     # and clicking again re-selects it, so without the empty step in between the second
-    # click matches the token from the first and the row can never be opened twice.
+    # click matches the token from the first and the cell can never be opened twice.
     st.session_state[f"picked_{name}"] = token
-    return None if not rows or seen == token else rows[0]
+    if seen == token:
+        return None
+    return next((row for row, col in cells if col == column), None)
 
-
-CLICK_HINT = "Click any row to open it."
 
 
 def goto(screen, **kwargs):
@@ -317,7 +320,7 @@ if screen == "portfolio":
                "commits", "clusters", "cross-module", "top_module", "analyzed"]
               + (["error"] if shown.error.notna().any() else [])],
         hide_index=True, width="stretch",
-        on_select="rerun", selection_mode="single-row", key="portfolio_tbl",
+        on_select="rerun", selection_mode="single-cell", key="portfolio_tbl",
         column_config={
             "rework": st.column_config.NumberColumn(
                 format="%d",
@@ -329,8 +332,8 @@ if screen == "portfolio":
             ),
         },
     )
-    st.caption(CLICK_HINT)
-    hit = picked_row(picked, "portfolio_tbl", tuple(repo_paths))
+    st.caption("Click a project name to open it.")
+    hit = picked_row(picked, "portfolio_tbl", tuple(repo_paths), "project")
     if hit is not None:
         goto("clusters", repo_path=shown.path.iat[hit],
              cluster_id=None, file_path=None)
@@ -441,7 +444,7 @@ if screen == "clusters":
     table = churn.cluster_stats(shown, files, edges)
     picked = st.dataframe(
         table, hide_index=True, width="stretch",
-        on_select="rerun", selection_mode="single-row", key="clusters_tbl",
+        on_select="rerun", selection_mode="single-cell", key="clusters_tbl",
         column_config={
             "cluster": st.column_config.TextColumn(width="medium"),
             "modules": st.column_config.TextColumn(
@@ -486,12 +489,13 @@ if screen == "clusters":
             "last": st.column_config.TextColumn(help="Most recent month touched."),
         },
     )
-    hit = picked_row(picked, "clusters_tbl", repo)
+    hit = picked_row(picked, "clusters_tbl", repo, "cluster")
     if hit is not None:
         goto("files", cluster_id=int(
             clusters.loc[clusters.label == table.cluster.iat[hit], "cluster_id"].iat[0]))
     st.caption(
-        f"{CLICK_HINT} Read it as: **share** = how much of the repo, **churn/line** = "
+        "Click a cluster name to open it. Read it as: **share** = how much of the "
+        "repo, **churn/line** = "
         "how much rework, **cohesion** = whether the cluster is a real boundary, "
         "**in hotspot** = whether it is really just one file."
     )
@@ -566,7 +570,7 @@ elif screen == "files":
         )
     picked = st.dataframe(
         table, hide_index=True, width="stretch",
-        on_select="rerun", selection_mode="single-row", key=f"files_tbl_{cluster_id}",
+        on_select="rerun", selection_mode="single-cell", key=f"files_tbl_{cluster_id}",
         column_config={
             "file": st.column_config.TextColumn(width="large"),
             "debt": st.column_config.NumberColumn(
@@ -620,11 +624,12 @@ elif screen == "files":
             "last": st.column_config.TextColumn(help="Most recent month touched."),
         },
     )
-    hit = picked_row(picked, "files_tbl", cluster_id)
+    hit = picked_row(picked, "files_tbl", cluster_id, "file")
     if hit is not None:
         goto("detail", file_path=table.file.iat[hit])
     st.caption(
-        f"{CLICK_HINT} Read it as: **growth** near 0 = rework not new code, "
+        "Click a file name to open it. Read it as: **growth** near 0 = rework not "
+        "new code, "
         "**per commit** small = a file people keep poking, **outside** high = this "
         "file belongs to a different cluster than the algorithm put it in."
     )
@@ -811,9 +816,9 @@ elif screen == "detail":
         ]
         picked = st.dataframe(
             shown_partners, hide_index=True, width="stretch",
-            on_select="rerun", selection_mode="single-row", key=f"partners_{path}",
+            on_select="rerun", selection_mode="single-cell", key=f"partners_{path}",
         )
-        hit = picked_row(picked, "partners", path)
+        hit = picked_row(picked, "partners", path, "file")
         if hit is not None:
             jump = partners.iloc[hit]
             goto("detail", file_path=jump.b, cluster_id=int(jump.cluster_id))

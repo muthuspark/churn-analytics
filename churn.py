@@ -767,6 +767,85 @@ def people_effort(commits):
     return out.sort_values("days", ascending=False).reset_index()
 
 
+def _who(commits):
+    """The merged person, falling back to the raw name when there is no email."""
+    return commits.person if "person" in commits else commits.author
+
+
+def person_repos(commits, person):
+    """One row per repo this person worked in, with their own effort split.
+
+    Reads as a portfolio for one engineer: how their year divided between codebases,
+    and inside each, how much went on the product versus the machinery.
+    """
+    kinds = [name for name, _ in WORK_KINDS] + [PRODUCT]
+    mine = commits[_who(commits) == person]
+    if mine.empty:
+        return pd.DataFrame(columns=["repo", "days", "commits", "churn"] + kinds)
+    mine = mine.assign(day=mine.date.str[:10], kind=mine.path.map(work_kind))
+    seen = mine.drop_duplicates(["repo", "day", "path"])
+    per = seen.groupby(["repo", "day", "kind"]).size()
+    share = (per / per.groupby(level=[0, 1]).sum()).groupby(["repo", "kind"]).sum()
+    out = pd.DataFrame({
+        "days": mine.drop_duplicates(["repo", "day"]).groupby("repo").size(),
+        "commits": mine.groupby("repo").sha.nunique(),
+        "churn": mine.groupby("repo").churn.sum(),
+    })
+    wide = share.unstack(fill_value=0.0)
+    for name in kinds:
+        out[name] = ((wide[name] if name in wide else 0.0) / out.days).round(3)
+    return out.sort_values("days", ascending=False).reset_index()
+
+
+def person_ownership(commits, person, floor=0.6, min_days=3):
+    """Files where this person did most of the work — the bus-factor view.
+
+    Share is of the file's person-days, not its commits: someone who lands one big
+    change is not its owner, someone who returns to it every week is. A high share on
+    a file nobody else touches is knowledge sitting in one head.
+    """
+    if commits.empty:
+        return pd.DataFrame(columns=["repo", "path", "days", "share", "others"])
+    days = commits.assign(day=commits.date.str[:10], who=_who(commits)).drop_duplicates(
+        ["who", "day", "repo", "path"])
+    total = days.groupby(["repo", "path"]).size()
+    theirs = days[days.who == person].groupby(["repo", "path"]).size()
+    if theirs.empty:
+        return pd.DataFrame(columns=["repo", "path", "days", "share", "others"])
+    out = pd.DataFrame({
+        "days": theirs,
+        "share": (theirs / total.reindex(theirs.index)).round(2),
+        "others": days.groupby(["repo", "path"]).who.nunique().reindex(theirs.index) - 1,
+    })
+    out = out[(out.share >= floor) & (out.days >= min_days)]
+    return out.sort_values("days", ascending=False).reset_index()
+
+
+def person_peers(commits, person, top=12):
+    """Who else works on the same files — collaboration read off the code, not the org chart.
+
+    Counts files in common rather than commits, so two people who each touched the same
+    twenty files rank above one who made forty commits somewhere alone.
+    """
+    if commits.empty:
+        return pd.DataFrame(columns=["person", "shared files", "shared repos"])
+    tagged = commits.assign(who=_who(commits))
+    mine = tagged[tagged.who == person]
+    if mine.empty:
+        return pd.DataFrame(columns=["person", "shared files", "shared repos"])
+    my_files = set(zip(mine.repo, mine.path))
+    others = tagged[tagged.who != person]
+    hit = others[[(r, p) in my_files for r, p in zip(others.repo, others.path)]]
+    if hit.empty:
+        return pd.DataFrame(columns=["person", "shared files", "shared repos"])
+    out = pd.DataFrame({
+        "shared files": hit.drop_duplicates(["who", "repo", "path"]).groupby("who").size(),
+        "shared repos": hit.groupby("who").repo.nunique(),
+    })
+    return out.sort_values("shared files", ascending=False).head(top).reset_index(
+        names="person")
+
+
 def cluster_stats(clusters, files, edges, commits=None):
     """One row per cluster, for the table under the cluster treemap. Pure — no git.
 
@@ -1301,6 +1380,39 @@ def demo():
     assert ppl.loc["Bo"][PRODUCT] == 1.0 and ppl.loc["Bo"].repos == 1, ppl
     assert list(ppl.index) == ["Ava", "Bo"] or ppl.days.is_monotonic_decreasing
     assert people_effort(pd.DataFrame(columns=["author", "date", "path", "repo"])).empty
+
+    # The per-person drill-down. Ava works in two repos, Bo shares one file with her.
+    crew = pd.concat([
+        parse_numstat(f"{COMMIT_MARK}q1\t2026-06-01T09:00:00+00:00\tAva\tava@x.com\ta\n"
+                      "3\t0\tsrc/shared.java\n2\t0\tbuild.gradle\n").assign(repo="one"),
+        parse_numstat(f"{COMMIT_MARK}q2\t2026-06-02T09:00:00+00:00\tAva\tava@x.com\tb\n"
+                      "4\t0\tsrc/shared.java\n").assign(repo="one"),
+        parse_numstat(f"{COMMIT_MARK}q3\t2026-06-03T09:00:00+00:00\tAva\tava@x.com\tc\n"
+                      "5\t0\tsrc/solo.java\n").assign(repo="one"),
+        parse_numstat(f"{COMMIT_MARK}q4\t2026-06-04T09:00:00+00:00\tAva\tava@x.com\td\n"
+                      "1\t0\tsrc/other.java\n").assign(repo="two"),
+        parse_numstat(f"{COMMIT_MARK}q5\t2026-06-05T09:00:00+00:00\tBo\tbo@x.com\te\n"
+                      "9\t0\tsrc/shared.java\n").assign(repo="one"),
+    ], ignore_index=True)
+
+    reps = person_repos(crew, "Ava").set_index("repo")
+    assert list(reps.index) == ["one", "two"], list(reps.index)
+    assert reps.loc["one"].days == 3 and reps.loc["two"].days == 1, reps
+    # Day one was half build.gradle, the other two days pure product: 2.5 of 3 days.
+    assert reps.loc["one"]["build/CI"] == round(0.5 / 3, 3), reps.loc["one"]["build/CI"]
+    assert person_repos(crew, "Nobody").empty
+
+    own = person_ownership(crew, "Ava", floor=0.6, min_days=2).set_index("path")
+    # shared.java: Ava 2 days of 3, Bo the third -- two thirds is hers.
+    assert own.loc["src/shared.java"].share == 0.67, own.loc["src/shared.java"]
+    assert own.loc["src/shared.java"].others == 1, own
+    # solo.java is one day, under the floor, so it is not called ownership.
+    assert "src/solo.java" not in own.index, own.index.tolist()
+
+    peers = person_peers(crew, "Ava").set_index("person")
+    assert list(peers.index) == ["Bo"], peers
+    assert peers.loc["Bo"]["shared files"] == 1, peers    # only shared.java
+    assert person_peers(crew, "Bo").iloc[0]["person"] == "Ava"
     same_day = df.assign(person="Ava", date="2026-01-05T10:00:00+00:00")
     assert dev_days(same_day) == 1, dev_days(same_day)
     # Counting is on the merged person, so two git configs on one day are still one day.

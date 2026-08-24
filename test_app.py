@@ -96,6 +96,22 @@ def main(repo, other):
     assert ppl.repos.max() <= 2, ppl.repos.max()
     assert ppl.days.sum() > 0
 
+    # Clicking a name opens that person, and their detail adds up to their row.
+    row = ppl.iloc[0]
+    at.session_state["people_tbl"] = {"selection": {"cells": [[0, "author"]]}}
+    at.run()
+    assert not at.exception, at.exception
+    assert at.session_state["screen"] == "person", at.session_state["screen"]
+    assert at.session_state["person"] == row.author, at.session_state["person"]
+    where = next(d.value for d in at.dataframe if "commits" in d.value.columns
+                 and "repo" in d.value.columns)
+    # One row per repo they worked in, matching the count on the people table.
+    assert len(where) == row.repos, (len(where), row.repos)
+    # Per-repo days can exceed the person's own total: two repos on one day is one day
+    # for them but a day in each repo. It must never be lower.
+    assert where.days.sum() >= row.days, (where.days.sum(), row.days)
+    assert int(at.metric[1].value.replace(",", "")) == row.repos, at.metric[1].value
+
     # --- an emptied settings box falls back, it does not disable ------------------
     # Clearing a box used to mean "filter nothing", which silently let bot churn and
     # lockfiles back into every number while the screen still looked right.

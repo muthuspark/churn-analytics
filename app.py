@@ -25,6 +25,7 @@ st.session_state.setdefault("screen", "portfolio")
 st.session_state.setdefault("repo_path", None)
 st.session_state.setdefault("cluster_id", None)
 st.session_state.setdefault("file_path", None)
+st.session_state.setdefault("person", None)
 
 
 @st.cache_resource
@@ -544,6 +545,92 @@ if screen == "portfolio":
              cluster_id=None, file_path=None)
     st.stop()
 
+if screen == "person":
+    everyone = all_commits(tuple(repo_paths), since, int(max_files), patterns, bots)
+    person = st.session_state.person
+    mine = everyone[churn._who(everyone) == person] if not everyone.empty else everyone
+    with st.container(horizontal=True, gap="small", vertical_alignment="center"):
+        if st.button("projects", type="tertiary"):
+            goto("portfolio")
+        st.markdown(":gray[/]")
+        if st.button("people", type="tertiary"):
+            goto("people")
+        st.markdown(":gray[/]")
+        st.markdown(f"**{person}**")
+    if mine.empty:
+        st.info(f"No commits for {person} in this window.")
+        st.stop()
+
+    day = mine.date.str[:10]
+    tiles = st.columns(6)
+    tiles[0].metric("Active days", f"{day.nunique():,}")
+    tiles[1].metric("Repos", f"{mine.repo.nunique():,}")
+    tiles[2].metric("Commits", f"{mine.sha.nunique():,}")
+    tiles[3].metric("Churn", f"{int(mine.churn.sum()):,}")
+    tiles[4].metric("Files touched", f"{mine.path.nunique():,}")
+    tiles[5].metric("Active", f"{day.min()[:7]} to {day.max()[:7]}")
+    aliases = sorted(set(mine.author))
+    if len(aliases) > 1:
+        st.caption("Git identities merged into this person: " + ", ".join(f"`{a}`" for a in aliases))
+
+    st.caption("Active days per month")
+    st.bar_chart(mine.assign(month=day.str[:7]).drop_duplicates(["month", "date"])
+                 .groupby("month").size().rename("days"), color=HOT, height=180)
+
+    st.markdown("##### Where their time goes")
+    st.dataframe(
+        churn.person_repos(everyone, person).rename(columns={"product code": "product"}),
+        hide_index=True, width="stretch",
+        column_config={
+            "days": st.column_config.NumberColumn(format="%d"),
+            "commits": st.column_config.NumberColumn(format="%d"),
+            "churn": st.column_config.NumberColumn(format="%d"),
+            **{k: st.column_config.NumberColumn(format="percent")
+               for k in ("product", "build/CI", "deploy/config", "tests", "docs")},
+        },
+    )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### What only they touch")
+        own = churn.person_ownership(everyone, person)
+        if own.empty:
+            st.caption("No file where they did most of the work over several days.")
+        else:
+            st.dataframe(
+                own.head(12), hide_index=True, width="stretch",
+                column_config={
+                    "path": st.column_config.TextColumn(width="medium"),
+                    "days": st.column_config.NumberColumn(format="%d"),
+                    "share": st.column_config.ProgressColumn(
+                        "share", format="percent", min_value=0.0, max_value=1.0,
+                        help="Their share of that file's person-days."),
+                    "others": st.column_config.NumberColumn(
+                        format="%d", help="Other people who touched it. Zero is a "
+                                          "single point of knowledge."),
+                },
+            )
+            alone = own[own.others == 0]
+            if not alone.empty:
+                st.caption(f"**{len(alone)} file(s) nobody else touched all window.**")
+    with right:
+        st.markdown("##### Who they work alongside")
+        peers = churn.person_peers(everyone, person)
+        if peers.empty:
+            st.caption("No files shared with anyone else.")
+        else:
+            st.dataframe(
+                peers, hide_index=True, width="stretch",
+                column_config={
+                    "shared files": st.column_config.NumberColumn(
+                        format="%d", help="Files both people touched in the window. "
+                                          "Collaboration read off the code rather than "
+                                          "the org chart."),
+                    "shared repos": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+    st.stop()
+
 if screen == "people":
     if st.button("projects", type="tertiary"):
         goto("portfolio")
@@ -571,9 +658,10 @@ if screen == "people":
         f"Showing {len(shown_people)} of {len(people)}. Percentages are that person's "
         "own days, so each row sums to 100%."
     )
-    st.dataframe(
+    picked = st.dataframe(
         shown_people.rename(columns={"product code": "product"}),
         hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-cell", key="people_tbl",
         column_config={
             "author": st.column_config.TextColumn(width="medium"),
             "days": st.column_config.NumberColumn(
@@ -585,7 +673,11 @@ if screen == "people":
                for name in ("product", "build/CI", "deploy/config", "tests", "docs")},
         },
     )
+    hit = picked_row(picked, "people_tbl", who, "author")
+    if hit is not None:
+        goto("person", person=shown_people.author.iat[hit])
     st.caption(
+        "Click a name for their detail. "
         "A person-day is one author on one calendar day, split across the kinds of "
         "file they touched. It cannot tell ten minutes from eight hours, and it counts "
         "Git identities are merged into one person when their names match ignoring "

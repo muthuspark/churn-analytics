@@ -79,6 +79,32 @@ def main(repo, other):
     table = at2.dataframe[0].value
     assert (table["churn"].notna()).sum() >= 2, table[["project", "churn"]]
 
+    # --- an emptied settings box falls back, it does not disable ------------------
+    # Clearing a box used to mean "filter nothing", which silently let bot churn and
+    # lockfiles back into every number while the screen still looked right.
+    at = start([repo])
+    at.session_state["excludes_box"] = ""
+    at.session_state["ignore_box"] = ""
+    at.run()
+    assert not at.exception, at.exception
+    captions = [c.value for c in at.sidebar.caption]
+    assert any("built-in exclude glob" in c for c in captions), captions
+    assert any("built-in ignored author" in c for c in captions), captions
+
+    # "none" is the way to actually turn one off, and it says so on screen.
+    at.session_state["ignore_box"] = "none"
+    at.run()
+    assert any("No ignored author filtering" in c.value for c in at.sidebar.caption), \
+        [c.value for c in at.sidebar.caption]
+
+    # These boxes persist to the database, so put them back: a later assertion that
+    # silently ran with bots re-enabled would be testing something else entirely.
+    at.session_state["excludes_box"] = "\n".join(churn.EXCLUDE)
+    at.session_state["ignore_box"] = "\n".join(churn.IGNORE_AUTHORS)
+    at.run()
+    assert not at.sidebar.caption or all(
+        "built-in" not in c.value and "No " not in c.value for c in at.sidebar.caption)
+
     # --- the same three hops, driven by the TABLES rather than the treemaps -------
     # Every table that names a project, cluster or file navigates the same way the
     # treemap above it does; the row order is the table's, not the frame it came from.

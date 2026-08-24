@@ -115,6 +115,22 @@ def repo_name(path):
     return "/".join(parts) if parts else path
 
 
+def patterns_from(text, fallback):
+    """Lines of a settings box, falling back to the built-in list when it is empty.
+
+    An empty box means "I have not set this", not "filter nothing". Read the other way
+    round, clearing it by accident silently drops every exclusion and the numbers that
+    come back still look plausible — bot churn quietly returns and nothing says so.
+    A single line reading "none" is how to actually turn a list off.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return tuple(fallback)
+    if len(lines) == 1 and lines[0].lower() == "none":
+        return ()
+    return tuple(lines)
+
+
 def tail_of(path, keep=2):
     """Last few segments of a path. A deep Java path wraps the breadcrumb onto two
     lines and breaks its alignment; the full path still goes in the tooltip."""
@@ -200,15 +216,20 @@ with st.sidebar:
         help="Commits touching more files are ignored when building the co-change graph.",
     )
     excludes = st.text_area(
-        "Exclude globs", value=saved("excludes", "\n".join(churn.EXCLUDE)), height=140,
-        help="Generated files and lockfiles. They dominate churn and fake cross-module coupling.",
+        "Exclude globs", key="excludes_box",
+        value=saved("excludes", "\n".join(churn.EXCLUDE)), height=140,
+        help="Generated files and lockfiles. They dominate churn and fake cross-module "
+             "coupling. Empty falls back to the built-in list; type `none` to exclude "
+             "nothing at all.",
     )
     ignore_text = st.text_area(
-        "Ignore authors", value=saved("ignore_authors", "\n".join(churn.IGNORE_AUTHORS)),
+        "Ignore authors", key="ignore_box",
+        value=saved("ignore_authors", "\n".join(churn.IGNORE_AUTHORS)),
         height=110,
         help="Glob patterns, matched case-insensitively against the git author name. "
              "Their commits are dropped from everything — churn and rework as well as "
-             "the head count — because a sync agent's churn is code nobody wrote.",
+             "the head count — because a sync agent's churn is code nobody wrote. "
+             "Empty falls back to the built-in list; type `none` to keep every author.",
     )
     # Render-time only: not analyze() arguments, so moving these does not bust the cache.
     hot_pct = st.slider("Highlight top % churn", 1, 100, 20)
@@ -230,10 +251,17 @@ with st.sidebar:
         help="Files that never co-changed inside the commit-size cap. Usually most of "
              "the repo, so they crowd out the real clusters.",
     )
+    for label, chosen, box in [("exclude glob", patterns_from(excludes, churn.EXCLUDE), excludes),
+                               ("ignored author", patterns_from(ignore_text, churn.IGNORE_AUTHORS), ignore_text)]:
+        if not box.strip():
+            st.caption(f"Using the {len(chosen)} built-in {label} patterns.")
+        elif not chosen:
+            st.caption(f"No {label} filtering — every match is kept.")
+
     analyze_all = st.button("Analyze all", type="primary")
 
-patterns = tuple(line.strip() for line in excludes.splitlines() if line.strip())
-bots = tuple(line.strip() for line in ignore_text.splitlines() if line.strip())
+patterns = patterns_from(excludes, churn.EXCLUDE)
+bots = patterns_from(ignore_text, churn.IGNORE_AUTHORS)
 for key, value in [
     ("paths", paths_text), ("months", int(months)),
     ("max_files", int(max_files)), ("excludes", excludes),

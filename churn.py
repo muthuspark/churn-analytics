@@ -87,6 +87,11 @@ IGNORE_AUTHORS = (
     "*jenkins*",
     "*noreply*",
     "system administrator",
+    # Release engineering. Every one of its 1,349 commits reads "Auto merge",
+    # "Auto-generated SBOM" or "Automatic update of gradle dependency lockfiles", and
+    # its reverts of its own auto-merges delete real classes wholesale -- which is what
+    # put a 1,474-line migration component at the top of the churn ranking.
+    "releng-*",
 )
 
 
@@ -896,7 +901,7 @@ def demo():
     # code nobody wrote, so leaving it in would misrank the files it copies.
     assert is_bot("root") and is_bot("Code Sync Agent (Production)")
     assert is_bot("bitbucket-pipelines") and is_bot("dependabot[bot]")
-    assert not is_bot("Deep Nandi") and not is_bot("releng-whatfix")
+    assert is_bot("releng-whatfix") and not is_bot("Deep Nandi")
     assert not is_bot("root", ignore_authors := ("*bot*",)), "list must be honoured"
     botty = (
         f"{COMMIT_MARK}h1\t2026-01-05T10:00:00+00:00\tAva\treal work\n"

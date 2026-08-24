@@ -121,6 +121,13 @@ def load_repos(conn, paths):
     }
     rows = [stored.get(p, {"path": p}) for p in paths]
     df = pd.DataFrame(rows, columns=COLUMNS)
+    # A row saved before a column existed comes back as None, and one None among the
+    # integers is enough for pandas to type the whole column `object` — after which
+    # nlargest, comparisons and formatting all fail. Coerce by the declared type, so a
+    # never-analysed repo is NaN rather than a landmine.
+    for column, kind in COLUMN_TYPES.items():
+        if kind in ("INTEGER", "REAL"):
+            df[column] = pd.to_numeric(df[column], errors="coerce")
     # Never-analysed rows have no stored name, and a table of "None" is unreadable.
     df["name"] = df.name.fillna(df.path.map(lambda p: "/".join(p.split("/")[-2:])))
     return df
@@ -184,6 +191,17 @@ def demo():
         # Reopening the same file must see the saved rows — the whole point.
         conn = connect(db)
         assert load_repos(conn, ["/repos/a"]).total_churn.iat[0] == 250
+
+        # Mixed old and new rows must still come back numeric: one None among the ints
+        # types the column `object`, and nlargest then raises on a screen that has
+        # nothing to do with persistence.
+        save_repo(conn, {"path": "/repos/legacy", "name": "legacy", "dev_days": None})
+        save_repo(conn, {**row, "path": "/repos/fresh", "dev_days": 12})
+        mixed = load_repos(conn, ["/repos/legacy", "/repos/fresh"])
+        assert mixed.dev_days.dtype.kind == "f", mixed.dev_days.dtype
+        assert pd.isna(mixed.dev_days.iat[0]) and mixed.dev_days.iat[1] == 12, mixed.dev_days
+        assert mixed.nlargest(1, "dev_days").path.iat[0] == "/repos/fresh"
+
         conn.close()
 
         # A database written before a column existed must gain it, not blow up on the

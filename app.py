@@ -310,14 +310,48 @@ if screen == "portfolio":
             goto("clusters", repo_path=ranked.loc[ranked.name == picked, "path"].iat[0],
                  cluster_id=None, file_path=None)
 
+    KIND_COLS = {"days_product": "product code", "days_build": "build/CI",
+                 "days_config": "deploy/config", "days_tests": "tests",
+                 "days_docs": "docs"}
+    split = done[list(KIND_COLS)].sum().rename(KIND_COLS)
+    if split.sum():
+        st.markdown("##### Where the time goes")
+        total = split.sum()
+        infra = split[["build/CI", "deploy/config"]].sum()
+        band = pd.DataFrame({"kind": split.index, "days": split.values, "all": ""})
+        fig = px.bar(band[band.days > 0], x="days", y="all", color="kind",
+                     orientation="h", text="kind",
+                     color_discrete_sequence=[HOT, "#e06377", "#efa9a9", COOL, "#eeeeee"],
+                     custom_data=["kind", "days"])
+        fig.update_traces(
+            hovertemplate="%{customdata[0]}<br>%{customdata[1]:.0f} person-days"
+                          "<extra></extra>", textposition="inside", insidetextanchor="middle")
+        fig.update_yaxes(visible=False)
+        fig.update_xaxes(title=None)
+        fig.update_layout(height=110, showlegend=False, bargap=0.05,
+                          margin=dict(t=0, l=0, r=0, b=0))
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            f"**{total:,.0f} person-days** across {len(done)} repos, "
+            f"{int(done.devs.sum())} author identities. "
+            f"**{infra / total:.0%} went to build, deploy and config**; "
+            f"{split['product code'] / total:.0%} to product code. A person-day is one "
+            "author on one calendar day, shared across the kinds of file they touched "
+            "that day — so a Dockerfile edit alongside six classes does not count twice."
+        )
+
     shown = portfolio.rename(columns={
         "name": "project", "total_churn": "churn", "num_files": "files",
         "total_commits": "commits", "num_clusters": "clusters",
         "cross_module": "cross-module", "analyzed_at": "analyzed",
         "rework_density": "rework/line", "lines_now": "lines"}).sort_values(
-            "rework", ascending=False)
+            "dev_days", ascending=False)
+    kind_total = shown[list(KIND_COLS)].sum(axis=1)
+    shown["infra %"] = (
+        shown[["days_build", "days_config"]].sum(axis=1) / kind_total.replace(0, float("nan"))
+    ).round(3)
     picked = st.dataframe(
-        shown[["project", "dev_days", "devs", "rework", "rework/line", "lines",
+        shown[["project", "dev_days", "devs", "infra %", "rework", "rework/line", "lines",
                "churn", "density", "files", "commits", "clusters", "cross-module",
                "top_module", "analyzed"]
               + (["error"] if shown.error.notna().any() else [])],
@@ -338,7 +372,14 @@ if screen == "portfolio":
                      "by this to fund a team; rank by rework/line to fund a refactor.",
             ),
             "devs": st.column_config.NumberColumn(
-                format="%d", help="People who touched this repo in the window."
+                format="%d", help="Author identities that touched this repo. Counts "
+                                  "identities, not people — one person with two git "
+                                  "configs counts twice."
+            ),
+            "infra %": st.column_config.ProgressColumn(
+                "infra %", format="percent", min_value=0.0, max_value=1.0,
+                help="Share of this repo's person-days spent on build, CI, deploy and "
+                     "config rather than product code.",
             ),
             "lines": st.column_config.NumberColumn(
                 format="%d",

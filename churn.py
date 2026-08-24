@@ -594,6 +594,56 @@ def dev_days(commits, mapping=None):
     return grouped.groupby("group").who_when.nunique()
 
 
+# What a path is *for*. Order matters: the first match wins, so tests/build.gradle is
+# build work, not test work. Deliberately coarse -- the question these answer is "did
+# the day go on the product or on the machinery around it", not a taxonomy.
+WORK_KINDS = (
+    ("build/CI", r"(^|/)(build\.gradle|settings\.gradle|extensions\.gradle|pom\.xml"
+                 r"|Makefile|Dockerfile|docker-compose|Jenkinsfile|bitbucket-pipelines"
+                 r"|\.gitlab-ci|package\.json|tsconfig|webpack|babel|vite\.config"
+                 r"|jest\.config|\.eslintrc|eslint\.config)"
+                 r"|(^|/)(ci-cd|\.github|\.circleci|scripts|gradle)/"),
+    ("deploy/config", r"(^|/)(charts?|helm|k8s|kubernetes|terraform|deploy|conf|config"
+                      r"|configs|local-conf)/|\.(properties|env)$"
+                      r"|(^|/)(mounts\.template|entrypoint\.sh|nginx)"
+                      r"|application.*\.(ya?ml|properties)$"),
+    ("tests", r"(^|/)(tests?|spec|__tests__|__mocks__|e2e)/|\.(test|spec)\.[jt]sx?$"
+              r"|Test\.java$|_test\.py$|\.stories\.[jt]sx?$"),
+    ("docs", r"\.(md|rst|adoc)$|(^|/)docs?/"),
+)
+PRODUCT = "product code"
+INFRA = ("build/CI", "deploy/config")
+
+
+def work_kind(path):
+    """Which bucket a path belongs to. Everything unmatched is product code."""
+    for name, pattern in WORK_KINDS:
+        if re.search(pattern, path, re.I):
+            return name
+    return PRODUCT
+
+
+def effort_split(commits):
+    """Person-days per work kind — the infra-versus-features answer for one repo.
+
+    A person-day is indivisible, so it is shared out across the kinds that person
+    touched that day rather than counted once per kind. Otherwise someone who edits a
+    Dockerfile and six classes on Tuesday adds two full days to the total and the
+    percentages stop meaning anything. Weighted by distinct files, so the totals still
+    add up to the real number of days worked.
+    """
+    kinds = [name for name, _ in WORK_KINDS] + [PRODUCT]
+    if commits.empty:
+        return dict.fromkeys(kinds, 0.0)
+    touched = commits.assign(
+        kind=commits.path.map(work_kind), day=commits.date.str[:10]
+    ).drop_duplicates(["author", "day", "path"])
+    per = touched.groupby(["author", "day", "kind"]).size()
+    share = per / per.groupby(level=[0, 1]).sum()
+    total = share.groupby("kind").sum()
+    return {name: round(float(total.get(name, 0.0)), 1) for name in kinds}
+
+
 def cluster_stats(clusters, files, edges, commits=None):
     """One row per cluster, for the table under the cluster treemap. Pure — no git.
 
@@ -759,6 +809,10 @@ def summarise(clusters, files, commits):
         "rework": int(live.rework.sum()),
         "dev_days": int(dev_days(commits)),
         "devs": int(commits.author.nunique()),
+        **{f"days_{name}": value for name, value in zip(
+            ("build", "config", "tests", "docs", "product"),
+            [effort_split(commits)[k] for k in
+             ("build/CI", "deploy/config", "tests", "docs", PRODUCT)])},
         # The repo-level answer to "how much of this was rewriting, not writing".
         "rework_density": round(live.rework.sum() / lines_now, 2) if lines_now else None,
         "top_module": top_module,
@@ -1035,6 +1089,24 @@ def demo():
     # Three commits, but Ava made two of them on different days and Bo one: 3 person-
     # days, 2 people. Same-day commits by one person would have collapsed to one.
     assert s["dev_days"] == 3 and s["devs"] == 2, s
+    # Three product-code days in the fixture, nothing else -- poetry.lock is excluded
+    # before this ever runs and the .png is a binary diff.
+    assert s["days_product"] == 3.0 and s["days_build"] == 0.0, s
+
+    # effort_split: a day shared between kinds must not become two days.
+    mixed = parse_numstat(
+        f"{COMMIT_MARK}zzz\t2026-05-05T09:00:00+00:00\tAva\tship it\n"
+        "4\t0\tbuild.gradle\n"
+        "9\t1\tsrc/main/java/App.java\n"
+        "2\t0\tsrc/main/java/Util.java\n"
+    )
+    split = effort_split(mixed)
+    assert round(sum(split.values()), 3) == 1.0, split      # one person, one day
+    assert split["build/CI"] == round(1 / 3, 1), split      # one of three files
+    assert split[PRODUCT] == round(2 / 3, 1), split
+    assert effort_split(parse_numstat("")) == {
+        "build/CI": 0.0, "deploy/config": 0.0, "tests": 0.0, "docs": 0.0, PRODUCT: 0.0}
+    assert work_kind("tests/build.gradle") == "build/CI"    # first match wins
     same_day = df.assign(author="Ava", date="2026-01-05T10:00:00+00:00")
     assert dev_days(same_day) == 1, dev_days(same_day)
 

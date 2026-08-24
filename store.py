@@ -21,7 +21,8 @@ COLUMNS = (
     "path", "name", "analyzed_at", "since_months", "max_files",
     "total_churn", "total_commits", "num_files", "num_clusters",
     "cross_module", "lines_now", "density", "rework", "rework_density",
-    "dev_days", "devs", "top_module", "error",
+    "dev_days", "devs", "days_build", "days_config", "days_tests", "days_docs",
+    "days_product", "top_module", "error",
 )
 
 SCHEMA = """
@@ -42,6 +43,11 @@ CREATE TABLE IF NOT EXISTS repos (
   rework_density  REAL,
   dev_days        INTEGER,
   devs            INTEGER,
+  days_build      REAL,
+  days_config     REAL,
+  days_tests      REAL,
+  days_docs       REAL,
+  days_product    REAL,
   top_module      TEXT,
   error           TEXT
 );

@@ -63,13 +63,19 @@ def main(repo, other):
     # A bad path records its error and must NOT stop the others being saved.
     assert rows[rows.path == bad].iloc[0].error, "bad path should record an error"
     assert rows[rows.path == other].iloc[0].total_churn > 0, "third repo lost to the bad one"
-    assert len(at.get("plotly_chart")) == 1, "portfolio treemap missing"
+    # Effort band plus treemap.
+    assert len(at.get("plotly_chart")) == 2, len(at.get("plotly_chart"))
     assert len(at.dataframe) == 1, "portfolio table missing"
+    split = at.dataframe[0].value
+    # NaN for the bad path: no days recorded, so no split to show. Never out of range.
+    infra = split["infra %"]
+    assert infra.notna().sum() == 2, infra
+    assert infra.dropna().between(0, 1).all(), infra
 
     # --- persistence: a brand new app instance sees the stored rows ---------------
     at2 = start([repo, bad, other])
     assert not at2.exception, at2.exception
-    assert len(at2.get("plotly_chart")) == 1, "stored rows should render without re-analysing"
+    assert len(at2.get("plotly_chart")) == 2, "stored rows should render without re-analysing"
     table = at2.dataframe[0].value
     assert (table["churn"].notna()).sum() >= 2, table[["project", "churn"]]
 

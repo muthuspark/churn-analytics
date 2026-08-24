@@ -671,7 +671,7 @@ def cluster_stats(clusters, files, edges, commits=None):
     return out.reset_index(drop=True)
 
 
-def file_stats(files, edges, cluster_id):
+def file_stats(files, edges, cluster_id, commits=None):
     """One row per file in a cluster, for the table under the file treemap. Pure.
 
     Deliberately keeps files the treemap has to drop (deleted ones, which have no
@@ -698,6 +698,16 @@ def file_stats(files, edges, cluster_id):
         )
 
     rows = members.set_index("path")
+    # Person-days per file: the mapping is the identity, since here a file is the group.
+    # Optional, like it is for a cluster, so the frame works without a commits table.
+    blank = pd.Series(0, index=rows.index)
+    days = blank if commits is None else dev_days(
+        commits, pd.Series(rows.index, index=rows.index)
+    ).reindex(rows.index).fillna(0).astype(int)
+    people = blank if commits is None else (
+        commits[commits.path.isin(rows.index)].groupby("path").author.nunique()
+        .reindex(rows.index).fillna(0).astype(int))
+
     out = pd.DataFrame({
         "debt": rows.debt,
         "churn": rows.churn,
@@ -711,6 +721,11 @@ def file_stats(files, edges, cluster_id):
         "commits": rows.commits,
         # Separates a fiddly hotspot (many small edits) from a rewrite (few huge ones).
         "per commit": (rows.churn / rows.commits.clip(lower=1)).round().astype(int),
+        "devs": people,
+        "dev-days": days,
+        # Share of the cluster's person-days, so files compare against their neighbours
+        # rather than against the whole repo.
+        "effort": (days / days.sum()).round(3) if days.sum() else days,
         # Near 0 means the file was rewritten in place rather than grown: the same
         # lines kept being replaced. -1 is pure deletion, +1 pure addition.
         "growth": ((rows.added - rows.deleted) / rows.churn).round(2),
@@ -845,6 +860,17 @@ def demo():
     assert list(fs.index) == ["api/schema.py", "api/users.py"], list(fs.index)
     assert fs.loc["api/schema.py"].debt > fs.loc["api/users.py"].debt, fs.debt
     assert fs.loc["api/users.py"]["rework/line"] == round(4 / 100, 2), fs
+
+    # Person-days per file. users.py moved on two days (Ava, then Bo); schema.py the
+    # same; web/app.js on one. Effort is the share of the cluster's days, not the repo's.
+    withdays = file_stats(files, edges, 0, df).set_index("file")
+    assert withdays.loc["api/users.py"]["dev-days"] == 2, withdays
+    assert withdays.loc["api/users.py"].devs == 2, withdays
+    assert withdays.effort.sum() == 1.0, withdays.effort
+    lone = file_stats(files, edges, -1, df).set_index("file").loc["web/app.js"]
+    assert lone["dev-days"] == 1 and lone.devs == 1 and lone.effort == 1.0, lone
+    # Optional, same as for a cluster: no commits table means zeros, not a crash.
+    assert file_stats(files, edges, 0)["dev-days"].sum() == 0
     u = fs.loc["api/users.py"]
     assert u.churn == 17 and u.commits == 2 and u["per commit"] == 8, u  # 17/2, banker's
     assert u.share == round(17 / 23, 3), u.share

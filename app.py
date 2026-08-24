@@ -593,7 +593,7 @@ elif screen == "files":
                     delta=summary.modules, delta_color="off")
 
     st.markdown("##### Files")
-    table = churn.file_stats(files, edges, cluster_id)
+    table = churn.file_stats(files, edges, cluster_id, commits)
     hidden = table.lines.isna().sum()
     if hidden:
         st.caption(
@@ -637,6 +637,19 @@ elif screen == "files":
                 format="%d",
                 help="Churn per commit. Small = fiddly hotspot, many little edits. "
                      "Large = rewritten in a few big drops.",
+            ),
+            "devs": st.column_config.NumberColumn(
+                format="%d", help="People who touched this file."
+            ),
+            "dev-days": st.column_config.NumberColumn(
+                format="%d",
+                help="Distinct (person, day) pairs on this file — time spent, not "
+                     "lines moved. A small config file can outrank a big class.",
+            ),
+            "effort": st.column_config.ProgressColumn(
+                "effort", format="percent", min_value=0.0,
+                max_value=float(table.effort.max()) if len(table) else 1.0,
+                help="Share of this cluster's person-days.",
             ),
             "growth": st.column_config.NumberColumn(
                 format="%.2f",

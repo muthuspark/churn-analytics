@@ -95,6 +95,57 @@ IGNORE_AUTHORS = (
 )
 
 
+def canonical_people(commits):
+    """author -> one display name per human, merging that person's git identities.
+
+    Nobody keeps one git config. The same engineer appears as "Ronak Parmaar" and
+    "ronak.parmaar", and again as "himanshu.goel@WFX-LAP-1358.local" when a laptop
+    supplies the hostname as a domain. Left alone this splits one person's work in two
+    and makes the head count roughly double the team.
+
+    Two identities are the same person if their names match once punctuation and case
+    are dropped, OR the local part of their email does. Union both and take the
+    transitive closure, so "Naveen Kumar" under naveen.k@ and naveen.kumar@ collapses
+    even though neither rule alone reaches across.
+
+    The email local part carries the weight here: matching on the full address would
+    keep the laptop-hostname variants apart, and matching on names alone would miss
+    "Md. Owais" committing as "siawo-wh".
+    """
+    if commits.empty or "email" not in commits:
+        return pd.Series(dtype=object)
+    parent = {}
+
+    def find(key):
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    tidy_name = lambda n: re.sub(r"[^a-z]", "", (n or "").lower())
+    tidy_mail = lambda e: re.sub(r"[^a-z0-9]", "", (e or "").split("@")[0].lower().split("+")[0])
+
+    pairs = commits[["author", "email"]].drop_duplicates()
+    for author, email in pairs.itertuples(index=False):
+        parent[find(("name", tidy_name(author)))] = find(("mail", tidy_mail(email)))
+
+    members = {}
+    for author, _ in pairs.itertuples(index=False):
+        members.setdefault(find(("name", tidy_name(author))), set()).add(author)
+
+    # Prefer a name a human would recognise: "Ronak Parmaar" over "ronak.parmaar".
+    # Spaced beats run-together, capitalised beats lowercase, and the name itself is
+    # the last tiebreak so the choice does not wander between runs.
+    def display(names):
+        return max(names, key=lambda n: (" " in n, n != n.lower(), len(n), n))
+
+    return pd.Series({
+        author: display(group)
+        for group in members.values() for author in group
+    })
+
+
 def is_bot(author, patterns=IGNORE_AUTHORS):
     name = (author or "").lower()
     return any(fnmatch(name, pattern.lower()) for pattern in patterns)
@@ -124,7 +175,7 @@ def git_log(repo, since):
     return subprocess.run(
         [
             "git", "-C", repo, "log", "--numstat", "--no-merges",
-            f"--since={since}", f"--pretty=format:{COMMIT_MARK}%H\t%aI\t%an\t%s",
+            f"--since={since}", f"--pretty=format:{COMMIT_MARK}%H\t%aI\t%an\t%ae\t%s",
         ],
         capture_output=True, text=True, check=True,
     ).stdout
@@ -160,7 +211,7 @@ def git_file_hunks(repo, path, since):
         [
             "git", "-c", f"core.attributesfile={attributes_file()}", "-C", repo,
             "log", "-p", "-U0", "--no-merges", "--follow", f"--since={since}",
-            f"--pretty=format:{COMMIT_MARK}%H\t%aI\t%an\t%s", "--", path,
+            f"--pretty=format:{COMMIT_MARK}%H\t%aI\t%an\t%ae\t%s", "--", path,
         ],
         capture_output=True, text=True,
     ).stdout
@@ -178,12 +229,12 @@ def parse_hunks(text, ignore_authors=IGNORE_AUTHORS):
     above the hunk to match, and an unsupported format has no pattern to match with.
     """
     rows = []
-    sha = date = author = subject = None
+    sha = date = author = email = subject = None
     skip = False
     for line in text.splitlines():
         if line.startswith(COMMIT_MARK):
-            parts = (line[len(COMMIT_MARK):].split("\t", 3) + ["", "", ""])[:4]
-            sha, date, author, subject = parts
+            parts = (line[len(COMMIT_MARK):].split("\t", 4) + ["", "", "", ""])[:5]
+            sha, date, author, email, subject = parts
             skip = is_bot(author, ignore_authors)
             continue
         found = HUNK.match(line)
@@ -192,15 +243,17 @@ def parse_hunks(text, ignore_authors=IGNORE_AUTHORS):
         if found:
             _, removed, _, added, region = found.groups()
             rows.append((
-                region.strip(), sha, date, author, subject,
+                region.strip(), sha, date, author, email, subject,
                 1 if removed is None else int(removed),
                 1 if added is None else int(added),
             ))
     df = pd.DataFrame(
         rows,
-        columns=["region", "sha", "date", "author", "subject", "removed", "added"],
+        columns=["region", "sha", "date", "author", "email", "subject",
+                 "removed", "added"],
     )
     df["churn"] = df.added + df.removed
+    df["person"] = df.author.map(canonical_people(df))
     return df
 
 
@@ -258,11 +311,11 @@ def region_stats(hunks, top=30):
         edits=("sha", "size"),
         commits=("sha", "nunique"),
         last=("date", "max"),
-        authors=("author", "nunique"),
+        authors=("person", "nunique"),
         # Bus factor: one name doing nearly all of it is knowledge in one head. Many
         # names on one region is the opposite risk -- nobody owns it.
-        owner=("author", lambda s: s.mode().iat[0] if len(s) else ""),
-        owner_share=("author", lambda s: round(s.value_counts(normalize=True).iat[0], 2)),
+        owner=("person", lambda s: s.mode().iat[0] if len(s) else ""),
+        owner_share=("person", lambda s: round(s.value_counts(normalize=True).iat[0], 2)),
         # Longest heading seen for this symbol: the fullest signature, for the tooltip.
         signature=("region", lambda s: max(s, key=len)),
     ).reset_index().rename(columns={"symbol": "region"})
@@ -450,14 +503,14 @@ def ticket_projects(subjects):
 def parse_numstat(text, patterns=EXCLUDE, ignore_authors=IGNORE_AUTHORS):
     """git log --numstat output -> DataFrame(path, sha, date, added, deleted)."""
     rows = []
-    sha = date = author = subject = None
+    sha = date = author = email = subject = None
     skip = False
     for line in text.splitlines():
         if line.startswith(COMMIT_MARK):
             # Subject goes last and keeps maxsplit, so a tab inside it stays in it.
             # A subject can also be empty, so pad rather than unpack strictly.
-            parts = (line[len(COMMIT_MARK):].split("\t", 3) + ["", "", ""])[:4]
-            sha, date, author, subject = parts
+            parts = (line[len(COMMIT_MARK):].split("\t", 4) + ["", "", "", ""])[:5]
+            sha, date, author, email, subject = parts
             skip = is_bot(author, ignore_authors)
         elif "\t" in line and not skip:
             added, deleted, path = line.split("\t", 2)
@@ -466,11 +519,15 @@ def parse_numstat(text, patterns=EXCLUDE, ignore_authors=IGNORE_AUTHORS):
             path = resolve_rename(path)
             if excluded(path, patterns):
                 continue
-            rows.append((path, sha, date, author, subject, int(added), int(deleted)))
+            rows.append((path, sha, date, author, email, subject,
+                         int(added), int(deleted)))
     df = pd.DataFrame(
-        rows, columns=["path", "sha", "date", "author", "subject", "added", "deleted"]
+        rows,
+        columns=["path", "sha", "date", "author", "email", "subject",
+                 "added", "deleted"],
     )
     df["churn"] = df.added + df.deleted
+    df["person"] = df.author.map(canonical_people(df))
     return df
 
 
@@ -617,9 +674,8 @@ def dev_days(commits, mapping=None):
     the same as a day they spent eight hours. It is right about where attention goes,
     not about how many hours went there.
     """
-    stamped = commits.assign(
-        who_when=commits.author.fillna("") + "|" + commits.date.str[:10]
-    )
+    who = commits.person if "person" in commits else commits.author
+    stamped = commits.assign(who_when=who.fillna("") + "|" + commits.date.str[:10])
     if mapping is None:
         return stamped.who_when.nunique()
     grouped = stamped.assign(group=stamped.path.map(mapping)).dropna(subset=["group"])
@@ -668,9 +724,10 @@ def effort_split(commits):
     if commits.empty:
         return dict.fromkeys(kinds, 0.0)
     touched = commits.assign(
-        kind=commits.path.map(work_kind), day=commits.date.str[:10]
-    ).drop_duplicates(["author", "day", "path"])
-    per = touched.groupby(["author", "day", "kind"]).size()
+        kind=commits.path.map(work_kind), day=commits.date.str[:10],
+        who=commits.person if "person" in commits else commits.author,
+    ).drop_duplicates(["who", "day", "path"])
+    per = touched.groupby(["who", "day", "kind"]).size()
     share = per / per.groupby(level=[0, 1]).sum()
     total = share.groupby("kind").sum()
     return {name: round(float(total.get(name, 0.0)), 1) for name in kinds}
@@ -689,8 +746,10 @@ def people_effort(commits):
     kinds = [name for name, _ in WORK_KINDS] + [PRODUCT]
     if commits.empty:
         return pd.DataFrame(columns=["author", "days", "repos"] + kinds)
-    touched = commits.assign(
-        kind=commits.path.map(work_kind), day=commits.date.str[:10]
+    # Recomputed across every repo: a person's two configs may never meet inside one.
+    merged = commits.assign(author=commits.author.map(canonical_people(commits)))
+    touched = merged.assign(
+        kind=merged.path.map(work_kind), day=merged.date.str[:10]
     ).drop_duplicates(["author", "day", "repo", "path"])
     # One day is one day however many files it spans, so share it across the kinds
     # that person touched rather than counting the day once per kind.
@@ -754,7 +813,7 @@ def cluster_stats(clusters, files, edges, commits=None):
         commits, files.set_index("path").cluster_id).reindex(blank.index).fillna(0).astype(int)
     people = blank if commits is None else (
         commits.assign(c=commits.path.map(files.set_index("path").cluster_id))
-        .dropna(subset=["c"]).groupby("c").author.nunique()
+        .dropna(subset=["c"]).groupby("c").person.nunique()
         .reindex(blank.index).fillna(0).astype(int))
 
     out = pd.DataFrame({
@@ -819,7 +878,7 @@ def file_stats(files, edges, cluster_id, commits=None):
         commits, pd.Series(rows.index, index=rows.index)
     ).reindex(rows.index).fillna(0).astype(int)
     people = blank if commits is None else (
-        commits[commits.path.isin(rows.index)].groupby("path").author.nunique()
+        commits[commits.path.isin(rows.index)].groupby("path").person.nunique()
         .reindex(rows.index).fillna(0).astype(int))
 
     out = pd.DataFrame({
@@ -869,8 +928,8 @@ def summarise(clusters, files, commits):
     ]
     worst = hot.loc[hot.debt.idxmax()] if not hot.empty else None
     by_author = commits.assign(
-        d=commits.author.fillna("") + "|" + commits.date.str[:10]
-    ).drop_duplicates("d").author.value_counts()
+        d=commits.person.fillna("") + "|" + commits.date.str[:10]
+    ).drop_duplicates("d").person.value_counts()
 
     return {
         "total_churn": int(files.churn.sum()),
@@ -886,7 +945,7 @@ def summarise(clusters, files, commits):
         "density": round(live.churn.sum() / lines_now, 2) if lines_now else None,
         "rework": int(live.rework.sum()),
         "dev_days": int(dev_days(commits)),
-        "devs": int(commits.author.nunique()),
+        "devs": int(commits.person.nunique()),
         **{f"days_{name}": value for name, value in zip(
             ("build", "config", "tests", "docs", "product"),
             [effort_split(commits)[k] for k in
@@ -897,7 +956,7 @@ def summarise(clusters, files, commits):
         # Where the most days went, which is rarely where the most lines went.
         "top_effort_file": sink,
         "top_effort_days": int(per_file.max()) if len(per_file) else 0,
-        "top_effort_devs": int(commits[commits.path == sink].author.nunique()) if sink else 0,
+        "top_effort_devs": int(commits[commits.path == sink].person.nunique()) if sink else 0,
         # Worst production file, so a review does not have to open every repo to find it.
         "top_debt_file": None if worst is None else worst.path,
         "top_debt": None if worst is None else float(worst.debt),
@@ -908,15 +967,15 @@ def summarise(clusters, files, commits):
 
 def demo():
     log = (
-        f"{COMMIT_MARK}aaa\t2026-01-05T10:00:00+00:00\tAva\tadd users\n"
+        f"{COMMIT_MARK}aaa\t2026-01-05T10:00:00+00:00\tAva\tava@x.com\tadd users\n"
         "10\t2\tapi/users.py\n"
         "3\t1\tapi/schema.py\n"
         "-\t-\tassets/logo.png\n"
         "9\t9\tpoetry.lock\n"
-        f"{COMMIT_MARK}bbb\t2026-02-05T10:00:00+00:00\tBo\t\n"
+        f"{COMMIT_MARK}bbb\t2026-02-05T10:00:00+00:00\tBo\tbo@x.com\t\n"
         "5\t0\tapi/{old => users}.py\n"
         "1\t1\tapi/schema.py\n"
-        f"{COMMIT_MARK}ccc\t2026-03-05T10:00:00+00:00\tAva\ttouch web\n"
+        f"{COMMIT_MARK}ccc\t2026-03-05T10:00:00+00:00\tAva\tava@x.com\ttouch web\n"
         "7\t0\tweb/app.js\n"
     )
     df = parse_numstat(log)
@@ -959,9 +1018,9 @@ def demo():
     assert is_bot("releng-whatfix") and not is_bot("Deep Nandi")
     assert not is_bot("root", ignore_authors := ("*bot*",)), "list must be honoured"
     botty = (
-        f"{COMMIT_MARK}h1\t2026-01-05T10:00:00+00:00\tAva\treal work\n"
+        f"{COMMIT_MARK}h1\t2026-01-05T10:00:00+00:00\tAva\tava@x.com\treal work\n"
         "5\t1\tapp.py\n"
-        f"{COMMIT_MARK}h2\t2026-01-06T10:00:00+00:00\tCode Sync Agent\tmirror\n"
+        f"{COMMIT_MARK}h2\t2026-01-06T10:00:00+00:00\tCode Sync Agent\tbot@x.com\tmirror\n"
         "900\t900\tapp.py\n"
     )
     assert parse_numstat(botty).churn.sum() == 6, parse_numstat(botty)
@@ -1045,10 +1104,10 @@ def demo():
 
     # parse_hunks / region_stats: the region view on the detail screen.
     patch = (
-        f"{COMMIT_MARK}aaa\t2026-01-05T10:00:00+00:00\tAva\tfix crash on save\n"
+        f"{COMMIT_MARK}aaa\t2026-01-05T10:00:00+00:00\tAva\tava@x.com\tfix crash on save\n"
         "@@ -10,4 +10,6 @@ def save(self):\n"
         "@@ -80 +80 @@ def load(self):\n"          # omitted count means 1
-        f"{COMMIT_MARK}bbb\t2026-03-05T10:00:00+00:00\tBo\trefactor save path\n"
+        f"{COMMIT_MARK}bbb\t2026-03-05T10:00:00+00:00\tBo\tbo@x.com\trefactor save path\n"
         "@@ -10,2 +10,0 @@ def save(self):\n"      # pure deletion
         "@@ -0,0 +1,7 @@\n"                         # whole-file add: git names nothing
     )
@@ -1069,7 +1128,7 @@ def demo():
     assert save["last"] == "2026-03", save["last"]
     # One method, two signatures: the same region, not two half-as-hot ones.
     split = parse_hunks(
-        f"{COMMIT_MARK}ccc\t2026-04-05T10:00:00+00:00\tAva\twiden save\n"
+        f"{COMMIT_MARK}ccc\t2026-04-05T10:00:00+00:00\tAva\tava@x.com\twiden save\n"
         "@@ -10,3 +10,3 @@ def save(self):\n"
         "@@ -40,1 +40,1 @@ def save(self, force=False):\n"
     )
@@ -1213,7 +1272,7 @@ def demo():
 
     # effort_split: a day shared between kinds must not become two days.
     mixed = parse_numstat(
-        f"{COMMIT_MARK}zzz\t2026-05-05T09:00:00+00:00\tAva\tship it\n"
+        f"{COMMIT_MARK}zzz\t2026-05-05T09:00:00+00:00\tAva\tava@x.com\tship it\n"
         "4\t0\tbuild.gradle\n"
         "9\t1\tsrc/main/java/App.java\n"
         "2\t0\tsrc/main/java/Util.java\n"
@@ -1228,11 +1287,11 @@ def demo():
 
     # people_effort: one day across two repos is one day, and the kinds sum to 1.
     two = pd.concat([
-        parse_numstat(f"{COMMIT_MARK}p1\t2026-06-01T09:00:00+00:00\tAva\tx\n"
+        parse_numstat(f"{COMMIT_MARK}p1\t2026-06-01T09:00:00+00:00\tAva\tava@x.com\tx\n"
                       "3\t0\tsrc/a.java\n").assign(repo="one"),
-        parse_numstat(f"{COMMIT_MARK}p2\t2026-06-01T17:00:00+00:00\tAva\ty\n"
+        parse_numstat(f"{COMMIT_MARK}p2\t2026-06-01T17:00:00+00:00\tAva\tava@x.com\ty\n"
                       "1\t0\tbuild.gradle\n").assign(repo="two"),
-        parse_numstat(f"{COMMIT_MARK}p3\t2026-06-02T09:00:00+00:00\tBo\tz\n"
+        parse_numstat(f"{COMMIT_MARK}p3\t2026-06-02T09:00:00+00:00\tBo\tbo@x.com\tz\n"
                       "2\t0\tsrc/b.java\n").assign(repo="one"),
     ])
     ppl = people_effort(two).set_index("author")
@@ -1242,8 +1301,40 @@ def demo():
     assert ppl.loc["Bo"][PRODUCT] == 1.0 and ppl.loc["Bo"].repos == 1, ppl
     assert list(ppl.index) == ["Ava", "Bo"] or ppl.days.is_monotonic_decreasing
     assert people_effort(pd.DataFrame(columns=["author", "date", "path", "repo"])).empty
-    same_day = df.assign(author="Ava", date="2026-01-05T10:00:00+00:00")
+    same_day = df.assign(person="Ava", date="2026-01-05T10:00:00+00:00")
     assert dev_days(same_day) == 1, dev_days(same_day)
+    # Counting is on the merged person, so two git configs on one day are still one day.
+    two_configs = parse_numstat(
+        f"{COMMIT_MARK}c1\t2026-07-01T09:00:00+00:00\tRonak Parmaar\tronak.parmaar@x.com\ta\n"
+        "1\t0\tsrc/a.py\n"
+        f"{COMMIT_MARK}c2\t2026-07-01T18:00:00+00:00\tronak.parmaar\tronak.parmaar@x.com\tb\n"
+        "1\t0\tsrc/b.py\n"
+    )
+    assert two_configs.author.nunique() == 2, "fixture should hold both spellings"
+    assert two_configs.person.nunique() == 1, set(two_configs.person)
+    assert dev_days(two_configs) == 1, dev_days(two_configs)
+
+    # canonical_people: name match, email-local match, and the transitive case.
+    ids = pd.DataFrame({
+        "author": ["Ronak Parmaar", "ronak.parmaar", "Naveen Kumar", "naveen kumar",
+                   "Md. Owais", "siawo-wh", "Solo Dev"],
+        "email": ["ronak.parmaar@whatfix.com", "ronak.parmaar@whatfix.com",
+                  "naveen.k@whatfix.com", "naveen.kumar@whatfix.com",
+                  "md.owais@whatfix.com", "md.owais@whatfix.com", "solo@x.com"],
+    })
+    who = canonical_people(ids)
+    assert who["ronak.parmaar"] == who["Ronak Parmaar"] == "Ronak Parmaar", who.to_dict()
+    # Two different emails, joined only because the names normalise the same.
+    assert who["naveen kumar"] == who["Naveen Kumar"] == "Naveen Kumar", who.to_dict()
+    # Two unrelated-looking names, joined only because the email local part matches.
+    assert who["siawo-wh"] == who["Md. Owais"] == "Md. Owais", who.to_dict()
+    assert who["Solo Dev"] == "Solo Dev"
+    assert len(who) == 7 and who.nunique() == 4, sorted(set(who))
+    # A laptop hostname as the domain must not split a person off.
+    laptop = pd.DataFrame({"author": ["Himanshu Goel", "Himanshu Goel"],
+                           "email": ["himanshu.goel@WFX-LAP-1358.local",
+                                     "himanshu.goel@whatfix.com"]})
+    assert canonical_people(laptop).nunique() == 1
 
     # dev_days per cluster, and effort as a share of the repo's days.
     stats = cluster_stats(clusters, files, edges, df).set_index("cluster")

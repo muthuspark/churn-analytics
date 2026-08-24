@@ -136,8 +136,9 @@ def portfolio_review(done):
                     delta_color="off")
     # Identities, not people: one person with two git configs is counted twice, and
     # saying "developers" here would be a number someone repeats in a board deck.
-    tiles[1].metric("Author identities", f"{int(done.devs.sum()):,}",
-                    delta="not a head count", delta_color="off")
+    # Summed across repos, so someone working in five of them still counts five times.
+    tiles[1].metric("Repo memberships", f"{int(done.devs.sum()):,}",
+                    delta="see the people screen for a head count", delta_color="off")
     tiles[2].metric("Infra", f"{infra / total:.0%}",
                     delta="build, deploy, config", delta_color="off")
     tiles[3].metric("Tests", f"{kind_days['tests'] / total:.1%}",
@@ -554,8 +555,8 @@ if screen == "people":
         st.stop()
 
     tiles = st.columns(4)
-    tiles[0].metric("Author identities", f"{len(people):,}",
-                    delta="not a head count", delta_color="off")
+    tiles[0].metric("People", f"{len(people):,}",
+                    delta="git identities merged", delta_color="off")
     tiles[1].metric("Person-days", f"{int(people.days.sum()):,}",
                     delta="deduplicated across repos", delta_color="off")
     tiles[2].metric("Repos per person", f"{people.repos.median():.0f}",
@@ -587,7 +588,9 @@ if screen == "people":
     st.caption(
         "A person-day is one author on one calendar day, split across the kinds of "
         "file they touched. It cannot tell ten minutes from eight hours, and it counts "
-        "identities rather than people — someone with two git configs appears twice."
+        "Git identities are merged into one person when their names match ignoring "
+        "punctuation, or the local part of their email does — so Ronak Parmaar and "
+        "ronak.parmaar are one row."
     )
     st.stop()
 

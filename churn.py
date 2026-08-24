@@ -75,6 +75,26 @@ EXCLUDE = (
 )
 
 
+# Automation that commits like a person. Left out of everything, not just the head
+# count: a code-sync agent mirroring files between repos creates churn that no one
+# wrote, so counting it as rework would misrank the very files it copies.
+# Glob patterns, matched case-insensitively against the git author name.
+IGNORE_AUTHORS = (
+    "root",
+    "*bot*",
+    "*agent*",
+    "*pipelines*",
+    "*jenkins*",
+    "*noreply*",
+    "system administrator",
+)
+
+
+def is_bot(author, patterns=IGNORE_AUTHORS):
+    name = (author or "").lower()
+    return any(fnmatch(name, pattern.lower()) for pattern in patterns)
+
+
 def excluded(path, patterns=EXCLUDE):
     return any(fnmatch(path, pat) for pat in patterns)
 
@@ -145,7 +165,7 @@ def git_file_hunks(repo, path, since):
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 
 
-def parse_hunks(text):
+def parse_hunks(text, ignore_authors=IGNORE_AUTHORS):
     """git log -p -U0 output -> DataFrame(region, sha, date, subject, added, removed).
 
     `region` is git's section heading, which is only as good as the language's diff
@@ -154,12 +174,16 @@ def parse_hunks(text):
     """
     rows = []
     sha = date = author = subject = None
+    skip = False
     for line in text.splitlines():
         if line.startswith(COMMIT_MARK):
             parts = (line[len(COMMIT_MARK):].split("\t", 3) + ["", "", ""])[:4]
             sha, date, author, subject = parts
+            skip = is_bot(author, ignore_authors)
             continue
         found = HUNK.match(line)
+        if skip:
+            continue
         if found:
             _, removed, _, added, region = found.groups()
             rows.append((
@@ -418,17 +442,19 @@ def ticket_projects(subjects):
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
-def parse_numstat(text, patterns=EXCLUDE):
+def parse_numstat(text, patterns=EXCLUDE, ignore_authors=IGNORE_AUTHORS):
     """git log --numstat output -> DataFrame(path, sha, date, added, deleted)."""
     rows = []
     sha = date = author = subject = None
+    skip = False
     for line in text.splitlines():
         if line.startswith(COMMIT_MARK):
             # Subject goes last and keeps maxsplit, so a tab inside it stays in it.
             # A subject can also be empty, so pad rather than unpack strictly.
             parts = (line[len(COMMIT_MARK):].split("\t", 3) + ["", "", ""])[:4]
             sha, date, author, subject = parts
-        elif "\t" in line:
+            skip = is_bot(author, ignore_authors)
+        elif "\t" in line and not skip:
             added, deleted, path = line.split("\t", 2)
             if added == "-":  # binary diff
                 continue
@@ -517,8 +543,9 @@ def debt_score(rework_lines, lines, commits):
     return (rate * np.log2(1 + commits)).round(2)
 
 
-def analyze(repo, since, max_files_per_commit, patterns=EXCLUDE):
-    commits = parse_numstat(git_log(repo, since), patterns)
+def analyze(repo, since, max_files_per_commit, patterns=EXCLUDE,
+            ignore_authors=IGNORE_AUTHORS):
+    commits = parse_numstat(git_log(repo, since), patterns, ignore_authors)
     if commits.empty:
         empty = pd.DataFrame()
         return empty, empty, commits, empty
@@ -864,6 +891,23 @@ def demo():
     assert resolve_rename("old.py => new.py") == "new.py"
     assert resolve_rename("plain.py") == "plain.py"
     assert excluded("web/node_modules/x.js") and not excluded("web/app.js")
+
+    # Bots are dropped whole, not just from the head count: a sync agent's churn is
+    # code nobody wrote, so leaving it in would misrank the files it copies.
+    assert is_bot("root") and is_bot("Code Sync Agent (Production)")
+    assert is_bot("bitbucket-pipelines") and is_bot("dependabot[bot]")
+    assert not is_bot("Deep Nandi") and not is_bot("releng-whatfix")
+    assert not is_bot("root", ignore_authors := ("*bot*",)), "list must be honoured"
+    botty = (
+        f"{COMMIT_MARK}h1\t2026-01-05T10:00:00+00:00\tAva\treal work\n"
+        "5\t1\tapp.py\n"
+        f"{COMMIT_MARK}h2\t2026-01-06T10:00:00+00:00\tCode Sync Agent\tmirror\n"
+        "900\t900\tapp.py\n"
+    )
+    assert parse_numstat(botty).churn.sum() == 6, parse_numstat(botty)
+    assert set(parse_numstat(botty).author) == {"Ava"}
+    # Keeping them is one argument away, for anyone who wants the raw picture.
+    assert parse_numstat(botty, ignore_authors=()).churn.sum() == 1806
 
     # summarise: build the frames analyze() would produce from this fixture.
     files = df.groupby("path").agg(

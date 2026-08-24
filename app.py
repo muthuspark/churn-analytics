@@ -35,16 +35,16 @@ def db():
 
 
 @st.cache_data(show_spinner="Analyzing repo...")
-def analyze(repo, since, max_files_per_commit, patterns):
-    return churn.analyze(repo, since, max_files_per_commit, patterns)
+def analyze(repo, since, max_files_per_commit, patterns, ignore_authors):
+    return churn.analyze(repo, since, max_files_per_commit, patterns, ignore_authors)
 
 
 @st.cache_data(show_spinner="Reading hunks...")
-def file_hunks(repo, path, since):
+def file_hunks(repo, path, since, ignore_authors):
     """Per-hunk history for one file. Deliberately not part of analyze(): it is one
     extra `git log -p` per file, so it runs when someone opens that file's page rather
     than 64 times up front. Around 0.1-0.5s on the biggest files measured."""
-    return churn.parse_hunks(churn.git_file_hunks(repo, path, since))
+    return churn.parse_hunks(churn.git_file_hunks(repo, path, since), ignore_authors)
 
 
 @st.cache_data(show_spinner="Scanning line bands...")
@@ -203,6 +203,13 @@ with st.sidebar:
         "Exclude globs", value=saved("excludes", "\n".join(churn.EXCLUDE)), height=140,
         help="Generated files and lockfiles. They dominate churn and fake cross-module coupling.",
     )
+    ignore_text = st.text_area(
+        "Ignore authors", value=saved("ignore_authors", "\n".join(churn.IGNORE_AUTHORS)),
+        height=110,
+        help="Glob patterns, matched case-insensitively against the git author name. "
+             "Their commits are dropped from everything — churn and rework as well as "
+             "the head count — because a sync agent's churn is code nobody wrote.",
+    )
     # Render-time only: not analyze() arguments, so moving these does not bust the cache.
     hot_pct = st.slider("Highlight top % churn", 1, 100, 20)
     size_by = st.radio(
@@ -226,9 +233,11 @@ with st.sidebar:
     analyze_all = st.button("Analyze all", type="primary")
 
 patterns = tuple(line.strip() for line in excludes.splitlines() if line.strip())
+bots = tuple(line.strip() for line in ignore_text.splitlines() if line.strip())
 for key, value in [
     ("paths", paths_text), ("months", int(months)),
     ("max_files", int(max_files)), ("excludes", excludes),
+    ("ignore_authors", ignore_text),
 ]:
     if saved(key, None) != str(value):
         store.set_setting(conn, key, value)
@@ -241,7 +250,7 @@ def analyze_one(path):
            "analyzed_at": datetime.now().isoformat(timespec="seconds"),
            "since_months": int(months), "max_files": int(max_files)}
     try:
-        clusters, files, commits, _ = analyze(path, since, int(max_files), patterns)
+        clusters, files, commits, _ = analyze(path, since, int(max_files), patterns, bots)
         if clusters.empty:
             row["error"] = "no commits in window"
         else:
@@ -400,7 +409,7 @@ if not repo:
     goto("portfolio")
 
 try:
-    clusters, files, commits, edges = analyze(repo, since, int(max_files), patterns)
+    clusters, files, commits, edges = analyze(repo, since, int(max_files), patterns, bots)
 except subprocess.CalledProcessError as exc:
     st.error(f"git log failed for `{repo}`:\n\n```\n{exc.stderr.strip()}\n```")
     st.stop()
@@ -754,7 +763,7 @@ elif screen == "detail":
     st.bar_chart(monthly, color=[COOL, HOT])
 
     st.subheader("Hot regions inside the file")
-    hunks = file_hunks(repo, path, since)
+    hunks = file_hunks(repo, path, since, bots)
     regions = churn.region_stats(hunks)
     if regions.empty:
         st.caption("No diff hunks for this path in the window.")

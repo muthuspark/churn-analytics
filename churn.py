@@ -826,6 +826,20 @@ def summarise(clusters, files, commits):
     top_module = None
     if not real.empty:
         top_module = real.groupby("dominant_module").total_churn.sum().idxmax()
+
+    # The three facts a portfolio review always ends up asking for, computed here
+    # because the frames are already in hand. Recomputing them across 64 repos to draw
+    # one dashboard would mean re-reading every git log.
+    per_file = dev_days(commits, pd.Series(files.path.values, index=files.path.values))
+    sink = per_file.idxmax() if len(per_file) else None
+    hot = files[
+        files.path.map(work_kind).eq(PRODUCT) & files.debt.notna() & files.lines.ge(50)
+    ]
+    worst = hot.loc[hot.debt.idxmax()] if not hot.empty else None
+    by_author = commits.assign(
+        d=commits.author.fillna("") + "|" + commits.date.str[:10]
+    ).drop_duplicates("d").author.value_counts()
+
     return {
         "total_churn": int(files.churn.sum()),
         # From commits, not files.commits: a commit touching three files shows up in
@@ -848,6 +862,15 @@ def summarise(clusters, files, commits):
         # The repo-level answer to "how much of this was rewriting, not writing".
         "rework_density": round(live.rework.sum() / lines_now, 2) if lines_now else None,
         "top_module": top_module,
+        # Where the most days went, which is rarely where the most lines went.
+        "top_effort_file": sink,
+        "top_effort_days": int(per_file.max()) if len(per_file) else 0,
+        "top_effort_devs": int(commits[commits.path == sink].author.nunique()) if sink else 0,
+        # Worst production file, so a review does not have to open every repo to find it.
+        "top_debt_file": None if worst is None else worst.path,
+        "top_debt": None if worst is None else float(worst.debt),
+        # Bus factor: the largest share of this repo's days held by one person.
+        "solo_share": round(float(by_author.iat[0] / by_author.sum()), 2) if len(by_author) else None,
     }
 
 
@@ -1141,6 +1164,20 @@ def demo():
     # Three product-code days in the fixture, nothing else -- poetry.lock is excluded
     # before this ever runs and the .png is a binary diff.
     assert s["days_product"] == 3.0 and s["days_build"] == 0.0, s
+    # Both api files moved on the same two days, so either may win the tie -- what
+    # matters is the count and that web/app.js (one day) did not win.
+    assert s["top_effort_file"] in {"api/users.py", "api/schema.py"}, s
+    assert s["top_effort_days"] == 2 and s["top_effort_devs"] == 2, s
+    # Ava worked two of the three days.
+    assert s["solo_share"] == round(2 / 3, 2), s["solo_share"]
+    # schema.py is half the size for the same rework, so it carries the higher debt.
+    assert s["top_debt_file"] == "api/schema.py", s["top_debt_file"]
+    # web/app.js has no lines at HEAD, so it can never be the worst *live* file.
+    assert summarise(clusters, files.assign(debt=[1.0, 1.0, 99.0]), df
+                     )["top_debt_file"] != "web/app.js"
+    # A file under the 50-line floor is too small to call a redesign candidate.
+    tiny = files.assign(lines=[10, 10, 10])
+    assert summarise(clusters, tiny, df)["top_debt_file"] is None
 
     # effort_split: a day shared between kinds must not become two days.
     mixed = parse_numstat(

@@ -65,8 +65,10 @@ def main(repo, other):
     assert rows[rows.path == other].iloc[0].total_churn > 0, "third repo lost to the bad one"
     # Effort band plus treemap.
     assert len(at.get("plotly_chart")) == 2, len(at.get("plotly_chart"))
-    assert len(at.dataframe) == 1, "portfolio table missing"
-    split = at.dataframe[0].value
+    # Four review panels plus the portfolio table itself.
+    assert len(at.dataframe) == 5, len(at.dataframe)
+    assert len(at.metric) == 5, "review tiles missing"
+    split = next(d.value for d in at.dataframe if "infra %" in d.value.columns)
     # NaN for the bad path: no days recorded, so no split to show. Never out of range.
     infra = split["infra %"]
     assert infra.notna().sum() == 2, infra
@@ -76,7 +78,7 @@ def main(repo, other):
     at2 = start([repo, bad, other])
     assert not at2.exception, at2.exception
     assert len(at2.get("plotly_chart")) == 2, "stored rows should render without re-analysing"
-    table = at2.dataframe[0].value
+    table = next(d.value for d in at2.dataframe if "churn" in d.value.columns)
     assert (table["churn"].notna()).sum() >= 2, table[["project", "churn"]]
 
     # --- an emptied settings box falls back, it does not disable ------------------

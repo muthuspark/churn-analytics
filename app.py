@@ -109,6 +109,93 @@ def heat_source(repo, path, bands, lines):
         )
 
 
+KINDS = {"days_product": "product code", "days_build": "build/CI",
+         "days_config": "deploy/config", "days_tests": "tests", "days_docs": "docs"}
+
+
+def portfolio_review(done):
+    """The whole portfolio on one screen: scale, then the four things worth acting on.
+
+    Everything here comes off the stored rows, so it costs nothing to draw. The four
+    panels are deliberately different questions — an effort sink is not a debt hotspot
+    and neither is a bus factor — because ranking a portfolio on one number is how you
+    end up funding the biggest repo instead of the worst one.
+    """
+    if done.empty or not done[list(KINDS)].sum().sum():
+        return
+    kind_days = done[list(KINDS)].sum().rename(KINDS)
+    total = kind_days.sum()
+    infra = kind_days[["build/CI", "deploy/config"]].sum()
+    share = done[list(KINDS)].div(done[list(KINDS)].sum(axis=1).replace(0, float("nan")), axis=0)
+
+    st.markdown("##### Portfolio review")
+    tiles = st.columns(5)
+    tiles[0].metric("Person-days", f"{total:,.0f}", delta=f"{len(done)} repos",
+                    delta_color="off")
+    # Identities, not people: one person with two git configs is counted twice, and
+    # saying "developers" here would be a number someone repeats in a board deck.
+    tiles[1].metric("Author identities", f"{int(done.devs.sum()):,}",
+                    delta="not a head count", delta_color="off")
+    tiles[2].metric("Infra", f"{infra / total:.0%}",
+                    delta="build, deploy, config", delta_color="off")
+    tiles[3].metric("Tests", f"{kind_days['tests'] / total:.1%}",
+                    delta="of all effort", delta_color="off")
+    tiles[4].metric("Rework", f"{done.rework.sum() / done.total_churn.sum():.0%}",
+                    delta="of churn was rewriting", delta_color="off")
+
+    left, right = st.columns(2)
+    named = done.assign(
+        infra_pct=share[["days_build", "days_config"]].sum(axis=1),
+        test_pct=share.days_tests,
+    )
+
+    with left:
+        st.caption("**Effort sinks** — the file that ate the most days in each repo")
+        sinks = named[named.top_effort_file.notna()].nlargest(6, "top_effort_days")
+        st.dataframe(
+            sinks[["name", "top_effort_file", "top_effort_days", "top_effort_devs"]]
+            .rename(columns={"name": "project", "top_effort_file": "file",
+                             "top_effort_days": "days", "top_effort_devs": "devs"}),
+            hide_index=True, width="stretch",
+            column_config={"file": st.column_config.TextColumn(width="medium")},
+        )
+        st.caption("**Infra-heavy repos** — over a quarter of their days on plumbing")
+        heavy = named[(named.infra_pct > 0.25) & (named.dev_days >= 20)].nlargest(6, "infra_pct")
+        st.dataframe(
+            heavy[["name", "dev_days", "infra_pct"]].rename(
+                columns={"name": "project", "dev_days": "days", "infra_pct": "infra"}),
+            hide_index=True, width="stretch",
+            column_config={"infra": st.column_config.ProgressColumn(
+                "infra", format="percent", min_value=0.0, max_value=1.0)},
+        )
+
+    with right:
+        st.caption("**Redesign candidates** — worst production file in each repo")
+        debt = named[named.top_debt_file.notna()].nlargest(6, "top_debt")
+        st.dataframe(
+            debt[["name", "top_debt_file", "top_debt"]].rename(
+                columns={"name": "project", "top_debt_file": "file", "top_debt": "debt"}),
+            hide_index=True, width="stretch",
+            column_config={"file": st.column_config.TextColumn(width="medium"),
+                           "debt": st.column_config.NumberColumn(format="%.1f")},
+        )
+        st.caption("**Thin on tests** — under 1% of effort, and busy enough to matter")
+        thin = named[(named.test_pct < 0.01) & (named.dev_days >= 50)].nlargest(6, "dev_days")
+        st.dataframe(
+            thin[["name", "dev_days", "test_pct", "solo_share"]].rename(
+                columns={"name": "project", "dev_days": "days", "test_pct": "tests",
+                         "solo_share": "top dev"}),
+            hide_index=True, width="stretch",
+            column_config={
+                "tests": st.column_config.NumberColumn(format="percent"),
+                "top dev": st.column_config.NumberColumn(
+                    format="percent",
+                    help="Largest share of the repo's days held by one person — "
+                         "bus factor. Above 40% is worth a second owner."),
+            },
+        )
+
+
 def repo_name(path):
     """Last two segments, so sibling projects stay distinguishable."""
     parts = Path(path).parts[-2:]
@@ -346,6 +433,8 @@ if screen == "portfolio":
         if picked:
             goto("clusters", repo_path=ranked.loc[ranked.name == picked, "path"].iat[0],
                  cluster_id=None, file_path=None)
+
+    portfolio_review(done)
 
     KIND_COLS = {"days_product": "product code", "days_build": "build/CI",
                  "days_config": "deploy/config", "days_tests": "tests",

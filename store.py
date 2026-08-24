@@ -22,7 +22,8 @@ COLUMNS = (
     "total_churn", "total_commits", "num_files", "num_clusters",
     "cross_module", "lines_now", "density", "rework", "rework_density",
     "dev_days", "devs", "days_build", "days_config", "days_tests", "days_docs",
-    "days_product", "top_module", "error",
+    "days_product", "top_effort_file", "top_effort_days", "top_effort_devs",
+    "top_debt_file", "top_debt", "solo_share", "top_module", "error",
 )
 
 SCHEMA = """
@@ -48,6 +49,12 @@ CREATE TABLE IF NOT EXISTS repos (
   days_tests      REAL,
   days_docs       REAL,
   days_product    REAL,
+  top_effort_file TEXT,
+  top_effort_days INTEGER,
+  top_effort_devs INTEGER,
+  top_debt_file   TEXT,
+  top_debt        REAL,
+  solo_share      REAL,
   top_module      TEXT,
   error           TEXT
 );

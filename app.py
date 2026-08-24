@@ -114,6 +114,165 @@ KINDS = {"days_product": "product code", "days_build": "build/CI",
          "days_config": "deploy/config", "days_tests": "tests", "days_docs": "docs"}
 
 
+DEBT_HELP = """
+**debt = (rework ÷ lines now) × log₂(1 + commits)**
+
+- **rework** — lines a commit both added *and* removed, counted as `2 × min(added, deleted)`
+  per commit and summed. A file written once has churn but no rework. It is measured
+  inside each commit and never across the window, so a file added wholesale and later
+  deleted wholesale scores zero: that is creation and removal, not rework.
+- **rework ÷ lines now** — how many times each line *still in the file* has been written
+  over. 1.0 means the file has effectively been rewritten once.
+- **log₂(1 + commits)** — a damper, not a size bonus. It separates one big rewrite from
+  edits that kept coming back. Log rather than linear, because the thirtieth commit is
+  weaker evidence than the third; without it, a config file touched on every build wins
+  outright.
+
+**Reading it:** under 0.5 is settled · around 1 has been written over once · 3 and up has
+been rewritten again and again and is still moving. It ranks files against each other. It
+is not a unit, so no absolute value is a threshold on its own.
+
+**Who is eligible:** production files only — tests, build/CI, deploy, config and docs are
+all excluded. The file must still exist at HEAD and be at least 50 lines. Each repo
+contributes its single highest-scoring file, and the six worst of those are shown.
+
+**What it misses:** one sweeping rewrite and twenty small ones can land on a similar score
+for different reasons, and a file that shrank scores high on a small absolute amount of
+rework. Open the file and look at the commit count before acting on the rank.
+
+Code: `churn.debt_score`, and the eligibility filter in `churn.summarise`.
+"""
+
+# One place for every term the screens use, so a number never has to be explained twice.
+# (heading, standfirst, [(term, meaning)]) -- rendered on the definitions screen.
+DEFINITIONS = [
+    (
+        "Counting change",
+        "All of it comes from `git log --numstat` over the window in the sidebar. "
+        "No tickets, no timesheets.",
+        [
+            ("churn", "Lines added plus lines deleted, summed over commits. Honest "
+                      "about how much writing happened, but it cannot tell writing "
+                      "from rewriting."),
+            ("rework", "`2 × min(added, deleted)` per commit, summed. Lines replaced "
+                       "rather than added. A 1,600-line document committed once has "
+                       "1,600 churn and zero rework."),
+            ("lines now", "Lines the file has at HEAD today. Blank, or *gone*, means "
+                          "the file was deleted or emptied during the window, so its "
+                          "churn is history rather than a live hotspot."),
+            ("churn / line", "churn ÷ lines now. How many times the file has "
+                             "effectively been rewritten, with size divided out — big "
+                             "files churn more just for being big."),
+            ("rework / line", "rework ÷ lines now. The same idea, counting only "
+                              "replaced lines."),
+            ("debt", "rework ÷ lines now, damped by log₂(1 + commits). The redesign "
+                     "ranking. Full derivation at the bottom of this page."),
+            ("growth", "(added − deleted) ÷ churn. +1 is pure addition, −1 pure "
+                       "deletion, near 0 means the same lines were replaced in place."),
+            ("churn / commit", "Separates a fiddly hotspot — many small edits — from a "
+                               "rewrite, which is a few huge ones."),
+        ],
+    ),
+    (
+        "Effort",
+        "Lines are not effort. These columns are the closest git gets to time spent.",
+        [
+            ("person-day", "One person, one calendar day with a commit. Two repos on "
+                           "one day is still one day. It cannot tell ten minutes from "
+                           "eight hours, so it is right about where attention went, "
+                           "not how many hours went there."),
+            ("work kind", "Every path is product code, build/CI, deploy/config, tests "
+                          "or docs. First match wins, so `tests/build.gradle` counts as "
+                          "build work. Deliberately coarse."),
+            ("infra", "build/CI plus deploy/config — the machinery around the product, "
+                      "as opposed to the product."),
+            ("effort", "A file's or cluster's share of its group's person-days, so rows "
+                       "compare against their neighbours rather than the whole repo."),
+            ("split percentages", "A person-day is indivisible, so it is shared out "
+                                  "across the kinds that person touched that day, "
+                                  "weighted by distinct files. Each row sums to 100% "
+                                  "and the totals still add up to real days worked."),
+            ("repo memberships", "Per-repo identity counts, summed. Someone working in "
+                                 "five repos counts five times. It is not a head count "
+                                 "— the people screen has that."),
+            ("person", "Git identities merged into one when the names match ignoring "
+                       "punctuation and case, or when the local part of the email "
+                       "does. So `Ronak Parmaar` and `ronak.parmaar` are one row."),
+            ("top dev / bus factor", "The largest share of a repo's person-days held "
+                                     "by one person. Above 40% is worth a second "
+                                     "owner."),
+        ],
+    ),
+    (
+        "Clusters",
+        "Clusters are read off how the code actually changes, not off the folder tree.",
+        [
+            ("co-change", "Two files edited in the same commit get an edge; its weight "
+                          "is the number of such commits. Commits touching more files "
+                          "than the sidebar cap are skipped, which also drops mass "
+                          "renames and dependency bumps."),
+            ("cluster", "A Louvain community over that graph — a set of files that "
+                        "keep moving together, whatever directory they sit in."),
+            ("unclustered", "Files that never co-changed inside the cap. Usually most "
+                            "of the repo, so they are hidden by default."),
+            ("modules", "The top-level directory of a file. A cluster spanning several "
+                        "modules is a boundary that does not match how the work "
+                        "happens."),
+            ("cohesion", "Of all co-change weight touching a cluster's files, the share "
+                         "that stays inside it. Low means the cluster is a slice of "
+                         "something larger."),
+            ("in hotspot", "Share of the cluster's churn sitting in its single worst "
+                           "file. High means one hotspot wearing a cluster's clothes."),
+            ("outside", "Share of one file's co-change weight landing outside its own "
+                        "cluster. High on a big file means the cluster boundary runs "
+                        "through it."),
+            ("top partner", "The file it co-changed with most, and how many times."),
+        ],
+    ),
+    (
+        "Inside a file",
+        "The same questions one level down: which parts of the file, and whose.",
+        [
+            ("region", "The function, method or declaration git names in the hunk "
+                       "header. Edits to one symbol are grouped, so changing a "
+                       "signature does not split a method into two rows. "
+                       "*(unnamed region)* is a hunk git could not label — often a "
+                       "whole-file rewrite, or a format with no diff driver."),
+            ("edits", "Separate hunks touching a region. Many edits over few commits is "
+                      "one sweep; the same count spread over many commits is pressure."),
+            ("owned", "Share of a region's edits made by one person. Near 100% on a hot "
+                      "region is knowledge held in one head."),
+            ("where in the file", "Commits per slice of the file **as it stands "
+                                  "today**, from `git log -L`. It follows each range "
+                                  "back through history, so a line that moved is "
+                                  "counted where it now lives. Works on any language."),
+            ("of the rarer", "For two regions that change together: their shared "
+                             "commits as a share of the less-touched region's own "
+                             "commits. 100% means it never moves alone."),
+            ("tracker projects", "Ticket keys parsed out of commit subjects. Several "
+                                 "projects landing in one file is shared ownership."),
+        ],
+    ),
+    (
+        "What shapes every number above",
+        "Four sidebar settings decide what git is even asked. Change one and every "
+        "figure moves.",
+        [
+            ("months of history", "The window. Nothing before it exists here, so a file "
+                                  "rewritten two years ago looks calm."),
+            ("max files per commit", "Commits above the cap are ignored **when building "
+                                     "the co-change graph only**. Their churn, rework "
+                                     "and days still count."),
+            ("exclude globs", "Generated files and lockfiles, dropped everywhere. They "
+                              "dominate churn and fake cross-module coupling."),
+            ("ignore authors", "Name patterns whose commits are dropped from "
+                               "everything, head count included. A sync agent's churn "
+                               "is code nobody wrote."),
+        ],
+    ),
+]
+
+
 def portfolio_review(done):
     """The whole portfolio on one screen: scale, then the four things worth acting on.
 
@@ -175,13 +334,28 @@ def portfolio_review(done):
 
     with right:
         st.caption("**Redesign candidates** — worst production file in each repo")
+        # The one column on this page nobody can read off its name. Say what it is
+        # before the table, not in a tooltip nobody hovers.
+        st.markdown(
+            ":gray[**debt** = rework ÷ lines now × log₂(1 + commits) — how many times "
+            "each surviving line has been written over, damped by how many sittings it "
+            "took. **Under 0.5 settled · about 1 rewritten once over · 3+ rewritten "
+            "again and again.** Production files only, 50 lines or more, still alive "
+            "at HEAD.]"
+        )
+        with st.expander("How debt is scored"):
+            st.markdown(DEBT_HELP)
         debt = named[named.top_debt_file.notna()].nlargest(6, "top_debt")
         st.dataframe(
             debt[["name", "top_debt_file", "top_debt"]].rename(
                 columns={"name": "project", "top_debt_file": "file", "top_debt": "debt"}),
             hide_index=True, width="stretch",
             column_config={"file": st.column_config.TextColumn(width="medium"),
-                           "debt": st.column_config.NumberColumn(format="%.1f")},
+                           "debt": st.column_config.NumberColumn(
+                               format="%.1f",
+                               help="rework ÷ lines now × log2(1 + commits). About 1 "
+                                    "means the file has been written over once; 3 and "
+                                    "up means it kept being rewritten.")},
         )
         st.caption("**Thin on tests** — under 1% of effort, and busy enough to matter")
         thin = named[(named.test_pct < 0.01) & (named.dev_days >= 50)].nlargest(6, "dev_days")
@@ -311,6 +485,10 @@ conn = db()
 saved = lambda key, default: store.get_setting(conn, key, default)
 
 with st.sidebar:
+    # Reachable from every screen, because the term you cannot read is never on the
+    # page you happen to be standing on.
+    if st.button("Definitions", type="tertiary", icon=":material/help:"):
+        goto("definitions")
     paths_text = st.text_area(
         "Repo paths", value=saved("paths", ""), height=160,
         help="One absolute path per line. Saved to churn.db, so paste them once.",
@@ -410,6 +588,26 @@ if analyze_all and repo_paths:
 
 screen = st.session_state.screen
 repo = st.session_state.repo_path
+
+if screen == "definitions":
+    if st.button("projects", type="tertiary"):
+        goto("portfolio")
+    st.subheader("Definitions")
+    st.caption(
+        "Every number this app shows, what it is made of, and what it cannot see. "
+        "Everything is derived from `git log` alone — no tickets, no timesheets, and "
+        "no way to tell a good line from a bad one."
+    )
+    for heading, standfirst, terms in DEFINITIONS:
+        st.markdown(f"##### {heading}")
+        if standfirst:
+            st.caption(standfirst)
+        st.markdown("\n".join(f"- **{term}** — {meaning}" for term, meaning in terms))
+    st.markdown("##### Debt, in full")
+    st.caption("The redesign ranking, and the only column here that is a formula "
+               "rather than a count.")
+    st.markdown(DEBT_HELP)
+    st.stop()
 
 if screen == "portfolio":
     st.subheader("Projects")

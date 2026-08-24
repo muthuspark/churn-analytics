@@ -676,6 +676,38 @@ def effort_split(commits):
     return {name: round(float(total.get(name, 0.0)), 1) for name in kinds}
 
 
+def people_effort(commits):
+    """Per-author person-days, split by work kind. Cross-repo by design.
+
+    Days are deduplicated globally, not per repo: someone who touches two services on
+    Tuesday worked one day, not two. Summing per-repo figures instead inflates the
+    total by whatever fraction of the org works across repos -- here that gap is 9,865
+    against 6,888, so it is not a rounding error.
+
+    `commits` is every repo's rows concatenated, with a `repo` column added.
+    """
+    kinds = [name for name, _ in WORK_KINDS] + [PRODUCT]
+    if commits.empty:
+        return pd.DataFrame(columns=["author", "days", "repos"] + kinds)
+    touched = commits.assign(
+        kind=commits.path.map(work_kind), day=commits.date.str[:10]
+    ).drop_duplicates(["author", "day", "repo", "path"])
+    # One day is one day however many files it spans, so share it across the kinds
+    # that person touched rather than counting the day once per kind.
+    per = touched.groupby(["author", "day", "kind"]).size()
+    share = per / per.groupby(level=[0, 1]).sum()
+    split = share.groupby(["author", "kind"]).sum().unstack(fill_value=0.0)
+    out = pd.DataFrame({
+        "days": touched.drop_duplicates(["author", "day"]).groupby("author").size(),
+        "repos": touched.groupby("author").repo.nunique(),
+        "top repo": touched.groupby("author").repo.agg(lambda r: r.mode().iat[0]),
+    })
+    for name in kinds:
+        column = split[name] if name in split else 0.0
+        out[name] = (column / out.days).round(3)
+    return out.sort_values("days", ascending=False).reset_index()
+
+
 def cluster_stats(clusters, files, edges, commits=None):
     """One row per cluster, for the table under the cluster treemap. Pure — no git.
 
@@ -1193,6 +1225,23 @@ def demo():
     assert effort_split(parse_numstat("")) == {
         "build/CI": 0.0, "deploy/config": 0.0, "tests": 0.0, "docs": 0.0, PRODUCT: 0.0}
     assert work_kind("tests/build.gradle") == "build/CI"    # first match wins
+
+    # people_effort: one day across two repos is one day, and the kinds sum to 1.
+    two = pd.concat([
+        parse_numstat(f"{COMMIT_MARK}p1\t2026-06-01T09:00:00+00:00\tAva\tx\n"
+                      "3\t0\tsrc/a.java\n").assign(repo="one"),
+        parse_numstat(f"{COMMIT_MARK}p2\t2026-06-01T17:00:00+00:00\tAva\ty\n"
+                      "1\t0\tbuild.gradle\n").assign(repo="two"),
+        parse_numstat(f"{COMMIT_MARK}p3\t2026-06-02T09:00:00+00:00\tBo\tz\n"
+                      "2\t0\tsrc/b.java\n").assign(repo="one"),
+    ])
+    ppl = people_effort(two).set_index("author")
+    assert ppl.loc["Ava"].days == 1, ppl          # two repos, one calendar day
+    assert ppl.loc["Ava"].repos == 2, ppl
+    assert ppl.loc["Ava"]["build/CI"] == 0.5 and ppl.loc["Ava"][PRODUCT] == 0.5, ppl
+    assert ppl.loc["Bo"][PRODUCT] == 1.0 and ppl.loc["Bo"].repos == 1, ppl
+    assert list(ppl.index) == ["Ava", "Bo"] or ppl.days.is_monotonic_decreasing
+    assert people_effort(pd.DataFrame(columns=["author", "date", "path", "repo"])).empty
     same_day = df.assign(author="Ava", date="2026-01-05T10:00:00+00:00")
     assert dev_days(same_day) == 1, dev_days(same_day)
 

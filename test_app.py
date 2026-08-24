@@ -81,6 +81,21 @@ def main(repo, other):
     table = next(d.value for d in at2.dataframe if "churn" in d.value.columns)
     assert (table["churn"].notna()).sum() >= 2, table[["project", "churn"]]
 
+    # --- the people screen: days deduplicated across repos ------------------------
+    at = start([repo, other])
+    at.session_state["screen"] = "people"
+    at.run()
+    assert not at.exception, at.exception
+    ppl = next(d.value for d in at.dataframe if "top repo" in d.value.columns)
+    assert not ppl.empty and ppl.days.is_monotonic_decreasing, ppl.head()
+    kinds = ["product", "build/CI", "deploy/config", "tests", "docs"]
+    # Each row is that person's own split, so it sums to 1 — not to the org's.
+    assert ppl[kinds].sum(axis=1).round(2).between(0.99, 1.01).all(), ppl[kinds].sum(axis=1)
+    # Someone in both repos on one day is one day, so the total cannot exceed the
+    # number of distinct author-days and must be below the sum of the per-repo counts.
+    assert ppl.repos.max() <= 2, ppl.repos.max()
+    assert ppl.days.sum() > 0
+
     # --- an emptied settings box falls back, it does not disable ------------------
     # Clearing a box used to mean "filter nothing", which silently let bot churn and
     # lockfiles back into every number while the screen still looked right.

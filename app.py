@@ -128,6 +128,8 @@ def portfolio_review(done):
     infra = kind_days[["build/CI", "deploy/config"]].sum()
     share = done[list(KINDS)].div(done[list(KINDS)].sum(axis=1).replace(0, float("nan")), axis=0)
 
+    if st.button("Who spends time on what", type="tertiary", icon=":material/group:"):
+        goto("people")
     st.markdown("##### Portfolio review")
     tiles = st.columns(5)
     tiles[0].metric("Person-days", f"{total:,.0f}", delta=f"{len(done)} repos",
@@ -194,6 +196,25 @@ def portfolio_review(done):
                          "bus factor. Above 40% is worth a second owner."),
             },
         )
+
+
+@st.cache_data(show_spinner="Reading every repo's authors...")
+def all_commits(repo_paths, since, max_files, patterns, ignore_authors):
+    """Every repo's commit rows in one frame, tagged with the repo.
+
+    Per-repo rows cannot answer a per-person question: days have to be deduplicated
+    across the whole portfolio before they are counted. Each analyze() call is itself
+    cached, so this is cheap right after Analyze all and slow only on a cold start.
+    """
+    frames = []
+    for path in repo_paths:
+        try:
+            _, _, commits, _ = analyze(path, since, max_files, patterns, ignore_authors)
+        except (subprocess.CalledProcessError, OSError):
+            continue
+        if not commits.empty:
+            frames.append(commits.assign(repo=repo_name(path)))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def repo_name(path):
@@ -520,6 +541,54 @@ if screen == "portfolio":
     if hit is not None:
         goto("clusters", repo_path=shown.path.iat[hit],
              cluster_id=None, file_path=None)
+    st.stop()
+
+if screen == "people":
+    if st.button("projects", type="tertiary"):
+        goto("portfolio")
+    st.subheader("Who spends time on what")
+    everyone = all_commits(tuple(repo_paths), since, int(max_files), patterns, bots)
+    people = churn.people_effort(everyone)
+    if people.empty:
+        st.info("Nothing analysed yet. Press Analyze all on the projects screen.")
+        st.stop()
+
+    tiles = st.columns(4)
+    tiles[0].metric("Author identities", f"{len(people):,}",
+                    delta="not a head count", delta_color="off")
+    tiles[1].metric("Person-days", f"{int(people.days.sum()):,}",
+                    delta="deduplicated across repos", delta_color="off")
+    tiles[2].metric("Repos per person", f"{people.repos.median():.0f}",
+                    delta=f"median · max {int(people.repos.max())}", delta_color="off")
+    tiles[3].metric("Median days", f"{people.days.median():.0f}",
+                    delta=f"top author {int(people.days.max())}", delta_color="off")
+
+    who = st.text_input("Filter by name", placeholder="type part of a name")
+    shown_people = people[people.author.str.contains(who, case=False, na=False)] if who else people
+    ratio = st.columns(2)
+    ratio[0].caption(
+        f"Showing {len(shown_people)} of {len(people)}. Percentages are that person's "
+        "own days, so each row sums to 100%."
+    )
+    st.dataframe(
+        shown_people.rename(columns={"product code": "product"}),
+        hide_index=True, width="stretch",
+        column_config={
+            "author": st.column_config.TextColumn(width="medium"),
+            "days": st.column_config.NumberColumn(
+                format="%d", help="Distinct calendar days with a commit, across all "
+                                  "repos. Two repos on one day is still one day."),
+            "repos": st.column_config.NumberColumn(format="%d"),
+            "top repo": st.column_config.TextColumn(width="medium"),
+            **{name: st.column_config.NumberColumn(format="percent")
+               for name in ("product", "build/CI", "deploy/config", "tests", "docs")},
+        },
+    )
+    st.caption(
+        "A person-day is one author on one calendar day, split across the kinds of "
+        "file they touched. It cannot tell ten minutes from eight hours, and it counts "
+        "identities rather than people — someone with two git configs appears twice."
+    )
     st.stop()
 
 if not repo:

@@ -65,8 +65,10 @@ def main(repo, other):
     assert rows[rows.path == other].iloc[0].total_churn > 0, "third repo lost to the bad one"
     # Effort band plus treemap.
     assert len(at.get("plotly_chart")) == 2, len(at.get("plotly_chart"))
-    # Four review panels plus the portfolio table itself.
-    assert len(at.dataframe) == 5, len(at.dataframe)
+    # Four review panels plus the portfolio table itself, and a fifth panel whenever a
+    # repo has a file young enough to qualify. Counted as a range, because whether that
+    # panel draws depends on the age of whatever repo the test was pointed at.
+    assert 5 <= len(at.dataframe) <= 6, len(at.dataframe)
     assert len(at.metric) == 5, "review tiles missing"
     split = next(d.value for d in at.dataframe if "infra %" in d.value.columns)
     # NaN for the bad path: no days recorded, so no split to show. Never out of range.
@@ -111,6 +113,70 @@ def main(repo, other):
     # for them but a day in each repo. It must never be lower.
     assert where.days.sum() >= row.days, (where.days.sum(), row.days)
     assert int(at.metric[1].value.replace(",", "")) == row.repos, at.metric[1].value
+
+    # --- the org-wide file table: filter, sort, page, then open a row -------------
+    at = start([repo, other])
+    at.session_state["screen"] = "rework"
+    at.run()
+    assert not at.exception, at.exception
+
+    def widget(at, kind, label):
+        return [w for w in getattr(at, kind) if w.label == label][0]
+
+    org = next(d.value for d in at.dataframe
+               if "project" in d.value.columns and "rework/line" in d.value.columns)
+    # Default order is the whole list by rework, so the first page is the real top.
+    assert not org.empty and org.rework.is_monotonic_decreasing, org.head()
+    everything = int(at.metric[0].value.replace(",", ""))
+    assert everything >= len(org), (everything, len(org))
+
+    # Filtering narrows the list, and every surviving row matches.
+    widget(at, "text_input", "Filter by path").set_value(".py").run()
+    assert not at.exception, at.exception
+    narrowed = next(d.value for d in at.dataframe if "project" in d.value.columns)
+    assert not narrowed.empty and narrowed.file.str.endswith(".py").all(), narrowed.file
+
+    # Sorting runs over the filtered list before the page is cut, so reversing it must
+    # change the first row rather than reordering the 50 rows already on screen.
+    widget(at, "toggle", "Ascending").set_value(True).run()
+    flipped = next(d.value for d in at.dataframe if "project" in d.value.columns)
+    assert flipped.rework.is_monotonic_increasing, flipped.rework.tolist()
+
+    # Paging, and a filter change putting you back on page 1.
+    widget(at, "toggle", "Ascending").set_value(False).run()
+    widget(at, "text_input", "Filter by path").set_value("").run()
+    widget(at, "selectbox", "Rows per page").set_value(25).run()
+    first_page = next(d.value for d in at.dataframe if "project" in d.value.columns)
+    assert len(first_page) <= 25, len(first_page)
+    page = widget(at, "number_input", "Page")
+    if page.max > 1:
+        page.set_value(2).run()
+        assert not at.exception, at.exception
+        second = next(d.value for d in at.dataframe if "project" in d.value.columns)
+        # Compared as frames, not by file name: the same path can appear in two repos,
+        # so a name that shows up on both pages proves nothing either way.
+        assert not second.empty and not second.reset_index(drop=True).equals(
+            first_page.reset_index(drop=True)), second
+        widget(at, "text_input", "Filter by path").set_value("a").run()
+        assert widget(at, "number_input", "Page").value == 1, "filter must reset the page"
+        widget(at, "text_input", "Filter by path").set_value("").run()
+
+    # Clicking a file name opens it, in its own repo, with its cluster in hand.
+    shown = next(d.value for d in at.dataframe if "project" in d.value.columns)
+    at.session_state["rework_tbl"] = {"selection": {"cells": [[0, "file"]]}}
+    at.run()
+    assert not at.exception, at.exception
+    assert at.session_state["screen"] == "detail", at.session_state["screen"]
+    assert at.session_state["file_path"] == shown.file.iat[0], at.session_state["file_path"]
+    assert at.session_state["repo_path"] in (repo, other), at.session_state["repo_path"]
+
+    # A number is just a number, here as everywhere else.
+    at.session_state["screen"] = "rework"
+    at.session_state["rework_tbl"] = {"selection": {"cells": []}}
+    at.run()
+    at.session_state["rework_tbl"] = {"selection": {"cells": [[0, "churn"]]}}
+    at.run()
+    assert at.session_state["screen"] == "rework", at.session_state["screen"]
 
     # --- an emptied settings box falls back, it does not disable ------------------
     # Clearing a box used to mean "filter nothing", which silently let bot churn and

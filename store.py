@@ -23,7 +23,9 @@ COLUMNS = (
     "cross_module", "lines_now", "density", "rework", "rework_density",
     "dev_days", "devs", "days_build", "days_config", "days_tests", "days_docs",
     "days_product", "top_effort_file", "top_effort_days", "top_effort_devs",
-    "top_debt_file", "top_debt", "solo_share", "top_module", "error",
+    "top_debt_file", "top_debt", "new_files", "new_rework", "top_new_file",
+    "top_new_rework", "top_new_born", "top_new_days", "solo_share", "top_module",
+    "error",
 )
 
 SCHEMA = """
@@ -54,6 +56,12 @@ CREATE TABLE IF NOT EXISTS repos (
   top_effort_devs INTEGER,
   top_debt_file   TEXT,
   top_debt        REAL,
+  new_files       INTEGER,
+  new_rework      INTEGER,
+  top_new_file    TEXT,
+  top_new_rework  INTEGER,
+  top_new_born    TEXT,
+  top_new_days    INTEGER,
   solo_share      REAL,
   top_module      TEXT,
   error           TEXT

@@ -66,10 +66,12 @@ EXCLUDE = (
     "*.snap",
     "*/dist/*",
     "*/build/*",
+    "*/generated/*",
     "*/vendor/*",
     "*/node_modules/*",
     "dist/*",
     "build/*",
+    "generated/*",
     "vendor/*",
     "node_modules/*",
 )
@@ -179,6 +181,46 @@ def git_log(repo, since):
         ],
         capture_output=True, text=True, check=True,
     ).stdout
+
+
+def git_births(repo, since):
+    """Paths that first appeared inside the window, and the commit that added them.
+
+    `-M` is what makes this trustworthy. With rename detection on, moving an old class
+    into a new package is an R, not an A, so it never reads as newly written code. One
+    extra `git log` per repo, name-only: a quarter of a second on a 700-commit repo.
+    """
+    return subprocess.run(
+        [
+            "git", "-C", repo, "log", "--no-merges", "-M", "--diff-filter=A",
+            "--name-only", f"--since={since}", f"--pretty=format:{COMMIT_MARK}%aI",
+        ],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
+def parse_births(text, patterns=EXCLUDE):
+    """git log --diff-filter=A --name-only output -> {path: ISO date it appeared}.
+
+    Bot authors are deliberately kept, unlike everywhere else. Birth is a fact about
+    the file rather than a measure of effort: a class a codegen job wrote on Tuesday is
+    new code on Tuesday, whoever ran the job. Filtering it out would leave the file
+    looking older than the window -- absent from exactly the list it belongs at the top
+    of, while the human edits to it still counted.
+
+    Known limit: a file that predates the window, was deleted inside it and then
+    restored reads as newly created. Telling those apart needs history from before the
+    window, which is the one thing the window does not fetch.
+    """
+    births = {}
+    date = None
+    for line in text.splitlines():
+        if line.startswith(COMMIT_MARK):
+            date = line[len(COMMIT_MARK):]
+        elif line and date and not excluded(line, patterns):
+            # git walks newest first, so the last write for a path is its earliest add.
+            births[line] = date
+    return births
 
 
 def git_line_counts(repo):
@@ -631,6 +673,10 @@ def analyze(repo, since, max_files_per_commit, patterns=EXCLUDE,
     files["density"] = (files.churn / files.lines).round(1)
     files["rework"] = files.path.map(rework_per_file(commits)).fillna(0).astype(int)
     files["debt"] = debt_score(files.rework, files.lines, files.commits)
+    # When each file first appeared. Empty means it predates the window -- most of the
+    # repo, most of the time. For the rest, the window is not a truncation: their whole
+    # life is inside this log, so their rework is all the rework they have ever had.
+    files["born"] = files.path.map(parse_births(git_births(repo, since), patterns))
     files["cluster_id"] = files.path.map(assignment)
     files["module"] = files.path.str.split("/").str[0]
 
@@ -680,6 +726,24 @@ def dev_days(commits, mapping=None):
         return stamped.who_when.nunique()
     grouped = stamped.assign(group=stamped.path.map(mapping)).dropna(subset=["group"])
     return grouped.groupby("group").who_when.nunique()
+
+
+def days_alive(born, commits):
+    """Days from each file's birth to the window's last commit.
+
+    Measured against the repo's last activity rather than against today, because
+    rework can only land on days somebody is committing. A service nobody has touched
+    since March would otherwise make every file in it look older and calmer than it
+    was, and a file born a fortnight before the repo went quiet would be ranked as
+    though it had survived a year of pressure.
+    """
+    started = pd.to_datetime(born, format="ISO8601", utc=True, errors="coerce")
+    if commits.empty:
+        return pd.Series(pd.NA, index=started.index, dtype="Float64")
+    last = pd.to_datetime(
+        commits.date, format="ISO8601", utc=True, errors="coerce"
+    ).max()
+    return (last - started).dt.days
 
 
 # What a path is *for*. Order matters: the first match wins, so tests/build.gradle is
@@ -983,6 +1047,10 @@ def file_stats(files, edges, cluster_id, commits=None):
         "growth": ((rows.added - rows.deleted) / rows.churn).round(2),
         "outside": outward_share.reindex(rows.index),
         "top partner": strongest.reindex(rows.index),
+        # Blank means the file predates the window. A date here means the window holds
+        # the file's whole life, so every figure on this row is complete rather than
+        # clipped -- the only rows in the app of which that is true.
+        "born": rows.born.str[:10] if "born" in rows else pd.NA,
         "last": rows.last_month,
     }).sort_values(["debt", "churn"], ascending=False)
     return out.reset_index().rename(columns={"path": "file"})
@@ -1006,6 +1074,20 @@ def summarise(clusters, files, commits):
         files.path.map(work_kind).eq(PRODUCT) & files.debt.notna() & files.lines.ge(50)
     ]
     worst = hot.loc[hot.debt.idxmax()] if not hot.empty else None
+
+    # Code written inside the window, and the worst of it. Rework on a file this young
+    # is a design that did not survive contact with the problem; an old file churns for
+    # a dozen duller reasons. The 30-day floor keeps a file that is two weeks old off
+    # the top of the list on the strength of one bad afternoon.
+    born = files.born if "born" in files else pd.Series(index=files.index, dtype=object)
+    dated = files.assign(born=born, alive=days_alive(born, commits))
+    fresh = dated[dated.lines.notna() & dated.born.notna()]
+    young = fresh[
+        fresh.alive.ge(30) & fresh.rework.gt(0)
+        & fresh.path.map(work_kind).eq(PRODUCT) & fresh.lines.ge(50)
+    ]
+    newest = young.loc[young.rework.idxmax()] if not young.empty else None
+
     by_author = commits.assign(
         d=commits.person.fillna("") + "|" + commits.date.str[:10]
     ).drop_duplicates("d").person.value_counts()
@@ -1039,6 +1121,15 @@ def summarise(clusters, files, commits):
         # Worst production file, so a review does not have to open every repo to find it.
         "top_debt_file": None if worst is None else worst.path,
         "top_debt": None if worst is None else float(worst.debt),
+        # Files first written inside the window, live at HEAD. The share of the
+        # repo's rework sitting in them is the headline: rewriting code you wrote this
+        # year is a different problem from maintaining code you inherited.
+        "new_files": int(len(fresh)),
+        "new_rework": int(fresh.rework.sum()),
+        "top_new_file": None if newest is None else newest.path,
+        "top_new_rework": None if newest is None else int(newest.rework),
+        "top_new_born": None if newest is None else str(newest.born)[:10],
+        "top_new_days": None if newest is None else int(newest.alive),
         # Bus factor: the largest share of this repo's days held by one person.
         "solo_share": round(float(by_author.iat[0] / by_author.sum()), 2) if len(by_author) else None,
     }
@@ -1085,6 +1176,32 @@ def demo():
     )
     assert counts == {"api/users.py": 120, "weird/na:me.py": 7}, counts
 
+    added = (
+        f"{COMMIT_MARK}2026-03-05T10:00:00+00:00\n"
+        "api/users.py\n"
+        "server/generated/Model.java\n"
+        f"{COMMIT_MARK}2026-01-05T10:00:00+00:00\n"
+        "api/users.py\n"
+        "api/schema.py\n"
+    )
+    born = parse_births(added)
+    # Git walks newest first, so a path added twice keeps the older date: the file was
+    # created in January and merely re-added in March.
+    assert born["api/users.py"] == "2026-01-05T10:00:00+00:00", born
+    assert born["api/schema.py"] == "2026-01-05T10:00:00+00:00", born
+    # Generated stubs are build output that happens to be committed. Counting their
+    # rework as a design problem would bury every hand-written file under codegen.
+    assert "server/generated/Model.java" not in born, born
+    assert parse_births("") == {}
+
+    # Age runs to the repo's last commit, not to today, so a dormant repo does not
+    # quietly age its files.
+    span = days_alive(pd.Series(["2026-01-05T10:00:00+00:00", None]), df)
+    assert span.iat[0] == 59, span      # 5 Jan -> 5 Mar, the fixture's last commit
+    assert pd.isna(span.iat[1]), span   # no birthday means no age, not zero
+    assert pd.isna(days_alive(pd.Series(["2026-01-05T10:00:00+00:00"]),
+                              parse_numstat("")).iat[0])
+
     assert resolve_rename("a/b/{x => y}/c.py") == "a/b/y/c.py"
     assert resolve_rename("old.py => new.py") == "new.py"
     assert resolve_rename("plain.py") == "plain.py"
@@ -1121,6 +1238,8 @@ def demo():
     files["last_month"] = files.path.map(
         {"api/users.py": "2026-02", "api/schema.py": "2026-02", "web/app.js": "2026-03"}
     )
+    # Only schema.py was written inside the window; the other two predate it.
+    files["born"] = files.path.map({"api/schema.py": "2026-01-05T10:00:00+00:00"})
     clusters = pd.DataFrame([
         {"cluster_id": 0, "total_churn": 23, "dominant_module": "api", "num_modules": 2,
          "num_files": 2, "total_commits": 2, "label": "#0 api (2 files)"},
@@ -1348,6 +1467,31 @@ def demo():
     # A file under the 50-line floor is too small to call a redesign candidate.
     tiny = files.assign(lines=[10, 10, 10])
     assert summarise(clusters, tiny, df)["top_debt_file"] is None
+
+    # Only schema.py was born inside the window, and it is live, so it is the only
+    # file whose rework the window measures in full.
+    assert s["new_files"] == 1 and s["new_rework"] == 4, s
+    assert s["top_new_file"] == "api/schema.py", s["top_new_file"]
+    assert s["top_new_rework"] == 4 and s["top_new_born"] == "2026-01-05", s
+    assert s["top_new_days"] == 59, s["top_new_days"]
+    # Two weeks old is not evidence. One bad afternoon would otherwise top the list.
+    young = files.assign(born=["2026-01-05T10:00:00+00:00"] * 3).assign(
+        born=lambda d: d.path.map({"api/schema.py": "2026-03-01T10:00:00+00:00"}))
+    assert summarise(clusters, young, df)["top_new_file"] is None
+    # A file with no rework was written once and left alone -- that is not a problem.
+    calm = files.assign(rework=0)
+    assert summarise(clusters, calm, df)["top_new_file"] is None
+    assert summarise(clusters, calm, df)["new_files"] == 1, "still born in the window"
+    # Frames built before the column existed must not take the screen down.
+    older = files.drop(columns="born")
+    assert summarise(clusters, older, df)["top_new_file"] is None
+    assert summarise(clusters, older, df)["new_files"] == 0
+
+    # file_stats carries the date through, blank for anything older than the window.
+    dated = file_stats(files, edges, 0).set_index("file")
+    assert dated.loc["api/schema.py"].born == "2026-01-05", dated.born
+    assert pd.isna(dated.loc["api/users.py"].born), dated.born
+    assert pd.isna(file_stats(files.drop(columns="born"), edges, 0).born).all()
 
     # effort_split: a day shared between kinds must not become two days.
     mixed = parse_numstat(

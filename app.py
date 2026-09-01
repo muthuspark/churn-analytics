@@ -167,6 +167,22 @@ DEFINITIONS = [
                               "replaced lines."),
             ("debt", "rework ÷ lines now, damped by log₂(1 + commits). The redesign "
                      "ranking. Full derivation at the bottom of this page."),
+            ("born", "The commit that first added this path, inside the window. "
+                     "Rename detection is on, so moving an old class to a new package "
+                     "is not a birth. Blank means the file is older than the window. "
+                     "A file that predates the window, was deleted inside it and then "
+                     "restored will read as new — separating those needs history the "
+                     "window does not fetch."),
+            ("days alive", "From a file's birth to the repo's **last commit**, not to "
+                           "today. Rework only lands on days somebody is committing, "
+                           "so a service that went quiet in March must not make every "
+                           "file in it look older and calmer than it was."),
+            ("new-code rework", "Share of a repo's rework sitting in files born inside "
+                                "the window. For those files the window is not a "
+                                "truncation — their whole life is inside the log, so "
+                                "their rework is every line they have ever had "
+                                "rewritten. Every other figure in this app is clipped "
+                                "by the date range. This one is not."),
             ("growth", "(added − deleted) ÷ churn. +1 is pure addition, −1 pure "
                        "deletion, near 0 means the same lines were replaced in place."),
             ("churn / commit", "Separates a fiddly hotspot — many small edits — from a "
@@ -288,8 +304,12 @@ def portfolio_review(done):
     infra = kind_days[["build/CI", "deploy/config"]].sum()
     share = done[list(KINDS)].div(done[list(KINDS)].sum(axis=1).replace(0, float("nan")), axis=0)
 
-    if st.button("Who spends time on what", type="tertiary", icon=":material/group:"):
-        goto("people")
+    with st.container(horizontal=True, gap="small", vertical_alignment="center"):
+        if st.button("Who spends time on what", type="tertiary", icon=":material/group:"):
+            goto("people")
+        if st.button("Where is the rework happening in the org", type="tertiary",
+                     icon=":material/table_rows:"):
+            goto("rework")
     st.markdown("##### Portfolio review")
     tiles = st.columns(5)
     tiles[0].metric("Person-days", f"{total:,.0f}", delta=f"{len(done)} repos",
@@ -373,6 +393,68 @@ def portfolio_review(done):
             },
         )
 
+    st.caption("**Written this window, already being rewritten** — the worst new file "
+               "in each repo")
+    scored = done[done.new_rework.notna()]
+    # A repo younger than the window has every file born inside it and scores 100% by
+    # construction. The share of its files says so at a glance, so the reader is not
+    # left to work out why a whole service looks like it is being rewritten.
+    fresh = named[named.top_new_file.notna()].assign(
+        new_share=lambda d: d.new_files / d.num_files.replace(0, float("nan")))
+    if scored.empty:
+        st.caption(
+            "No repo has been analysed since this was added. Press Analyze all to fill "
+            "it in — it costs one extra `git log` per repo."
+        )
+    else:
+        share = scored.new_rework.sum() / max(1, scored.rework.sum())
+        st.markdown(
+            f":gray[**{share:.0%}** of the rework in {len(scored)} re-analysed repo(s) "
+            f"sits in files first written inside the {int(months)}-month window. Old "
+            "code churns for a dozen dull reasons — maintenance, dependency bumps, a "
+            "decade of small fixes. Code this young being rewritten is a design that "
+            "did not survive contact. A repo younger than the window scores 100% by "
+            "construction — the *of repo* column is the tell.]"
+        )
+        if fresh.empty:
+            st.caption("No new file cleared the bar: production code, 50+ lines, alive "
+                       "30 days or more, and reworked at least once.")
+        else:
+            st.dataframe(
+                fresh.nlargest(6, "top_new_rework")[
+                    ["name", "top_new_file", "top_new_born", "top_new_days",
+                     "top_new_rework", "new_files", "new_share"]
+                ].rename(columns={
+                    "name": "project", "top_new_file": "file", "top_new_born": "born",
+                    "top_new_days": "days alive", "top_new_rework": "rework",
+                    "new_files": "new files", "new_share": "of repo"}),
+                hide_index=True, width="stretch",
+                column_config={
+                    "file": st.column_config.TextColumn(width="medium"),
+                    "born": st.column_config.TextColumn(
+                        help="First commit that added this path, inside the window. "
+                             "Renames do not count as births."),
+                    "days alive": st.column_config.NumberColumn(
+                        format="%d",
+                        help="From that first commit to the repo's last commit, not to "
+                             "today. Rework can only land on days someone commits."),
+                    "rework": st.column_config.NumberColumn(
+                        format="%d",
+                        help="Lines written over since the file was created. Because "
+                             "the file was born inside the window, this is every line "
+                             "it has ever had rewritten — not a clipped figure."),
+                    "new files": st.column_config.NumberColumn(
+                        format="%d",
+                        help="Files in this repo first written inside the window and "
+                             "still alive at HEAD."),
+                    "of repo": st.column_config.NumberColumn(
+                        format="percent",
+                        help="Those new files as a share of the repo. Near 100% means "
+                             "the repo is younger than the window, so everything in it "
+                             "is new and the headline share below tells you nothing."),
+                },
+            )
+
 
 @st.cache_data(show_spinner="Reading every repo's authors...")
 def all_commits(repo_paths, since, max_files, patterns, ignore_authors):
@@ -391,6 +473,45 @@ def all_commits(repo_paths, since, max_files, patterns, ignore_authors):
         if not commits.empty:
             frames.append(commits.assign(repo=repo_name(path)))
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+@st.cache_data(show_spinner="Reading every repo's files...")
+def all_files(repo_paths, since, max_files, patterns, ignore_authors):
+    """Every repo's file rows in one frame, tagged with the repo.
+
+    The portfolio row keeps one file per repo — the worst by debt, the worst by days.
+    That is the right size for a dashboard and the wrong size for a search: a file
+    ranked second in a big repo outweighs the winner of a small one, and no per-repo
+    summary can say so. Each analyze() call is cached, so this costs nothing once the
+    people screen or Analyze all has been through the same repos.
+
+    Days and devs are folded in here rather than left to the caller, because they need
+    the commits frame that analyze() has already returned and nobody wants to hold 200
+    of those in memory to compute two columns.
+    """
+    frames = []
+    for path in repo_paths:
+        try:
+            _, files, commits, _ = analyze(path, since, max_files, patterns, ignore_authors)
+        except (subprocess.CalledProcessError, OSError):
+            continue
+        if files.empty:
+            continue
+        per_file = pd.Series(files.path.values, index=files.path.values)
+        frames.append(files.assign(
+            repo=repo_name(path),
+            repo_path=path,
+            kind=files.path.map(churn.work_kind),
+            devs=commits.groupby("path").person.nunique().reindex(files.path).values,
+            days=churn.dev_days(commits, per_file).reindex(files.path).values,
+        ))
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out["rework/line"] = (out.rework / out.lines).round(2)
+    for column in ("devs", "days"):
+        out[column] = out[column].fillna(0).astype(int)
+    return out
 
 
 def repo_name(path):
@@ -539,12 +660,23 @@ with st.sidebar:
         help="Files that never co-changed inside the commit-size cap. Usually most of "
              "the repo, so they crowd out the real clusters.",
     )
-    for label, chosen, box in [("exclude glob", patterns_from(excludes, churn.EXCLUDE), excludes),
-                               ("ignored author", patterns_from(ignore_text, churn.IGNORE_AUTHORS), ignore_text)]:
+    for label, defaults, box in [("exclude glob", churn.EXCLUDE, excludes),
+                                 ("ignored author", churn.IGNORE_AUTHORS, ignore_text)]:
+        chosen = patterns_from(box, defaults)
         if not box.strip():
             st.caption(f"Using the {len(chosen)} built-in {label} patterns.")
         elif not chosen:
             st.caption(f"No {label} filtering — every match is kept.")
+        elif missing := [p for p in defaults if p not in chosen]:
+            # These boxes are saved on first use, so a list typed months ago silently
+            # predates every pattern added since. Nothing else on screen would say so:
+            # the numbers come back looking perfectly plausible.
+            named = ", ".join(f"`{pattern}`" for pattern in missing[:3])
+            st.caption(
+                f"Your {label} list predates {len(missing)} built-in pattern(s): "
+                f"{named}{' and more' if len(missing) > 3 else ''}. Clear the box to "
+                "take the built-in list."
+            )
 
     analyze_all = st.button("Analyze all", type="primary")
 
@@ -827,6 +959,140 @@ if screen == "person":
                     "shared repos": st.column_config.NumberColumn(format="%d"),
                 },
             )
+    st.stop()
+
+if screen == "rework":
+    if st.button("projects", type="tertiary"):
+        goto("portfolio")
+    st.subheader("Where is the rework happening in the org")
+    st.caption(
+        "Every file in every repo in the sidebar, one table. **Rework** is lines a "
+        "commit both added and removed — code written over rather than written. Read "
+        "live from git rather than from the stored summaries, so the first visit after "
+        "a settings change is slow and every visit after it is instant."
+    )
+    everything = all_files(tuple(repo_paths), since, int(max_files), patterns, bots)
+    if everything.empty:
+        st.info("Nothing analysed yet. Press Analyze all on the projects screen.")
+        st.stop()
+
+    live = everything[everything.lines.notna()]
+    tiles = st.columns(4)
+    tiles[0].metric("Files", f"{len(everything):,}",
+                    delta=f"{everything.repo.nunique()} repos", delta_color="off")
+    tiles[1].metric("Rework", f"{int(everything.rework.sum()):,}",
+                    delta="lines written over", delta_color="off")
+    tiles[2].metric("Of all churn",
+                    f"{everything.rework.sum() / max(1, everything.churn.sum()):.0%}",
+                    delta="the rest was written once", delta_color="off")
+    tiles[3].metric("Rework / line", f"{live.rework.sum() / max(1, live.lines.sum()):.2f}",
+                    delta="live files only", delta_color="off")
+
+    # Filters first, sort second, page last. Any other order and the first page stops
+    # being the real top of the list -- see the caption under the table.
+    picks = st.columns([3, 2, 2])
+    query = picks[0].text_input(
+        "Filter by path", placeholder="controller, .yaml, src/main — any part of a path")
+    repos_chosen = picks[1].multiselect(
+        "Projects", sorted(everything.repo.unique()), placeholder="all")
+    kinds_chosen = picks[2].multiselect(
+        "Kind", sorted(everything.kind.unique()), placeholder="all",
+        help="What the path is for. Product code, or the machinery around it.")
+
+    knobs = st.columns([2, 2, 2, 2])
+    floor = knobs[0].number_input("Min rework", 0, value=0, step=50,
+                                  help="Lines written over. 0 keeps everything.")
+    lines_floor = knobs[1].number_input(
+        "Min lines", 0, value=0, step=50,
+        help="Size at HEAD. A one-line file with two rewrites is noise.")
+    live_only = knobs[2].checkbox(
+        "Live files only", value=True,
+        help="Drop files deleted or emptied since the window started. Their rework is "
+             "history, and they have no per-line figure.")
+    born_only = knobs[3].checkbox(
+        "Born in the window", value=False,
+        help="Only files first written inside the window. For those, the window holds "
+             "the file's whole life, so their rework is complete rather than clipped.")
+
+    shown = everything
+    if query:
+        shown = shown[shown.path.str.contains(query, case=False, regex=False)]
+    if repos_chosen:
+        shown = shown[shown.repo.isin(repos_chosen)]
+    if kinds_chosen:
+        shown = shown[shown.kind.isin(kinds_chosen)]
+    if live_only:
+        shown = shown[shown.lines.notna()]
+    if born_only:
+        shown = shown[shown.born.notna()]
+    shown = shown[shown.rework.ge(floor)]
+    if lines_floor:
+        shown = shown[shown.lines.ge(lines_floor)]
+
+    SORTS = {"rework": "rework", "rework / line": "rework/line", "debt": "debt",
+             "churn": "churn", "churn / line": "density", "lines": "lines",
+             "commits": "commits", "dev-days": "days", "devs": "devs",
+             "born": "born", "last touched": "last_month"}
+    order = st.columns([3, 2, 2, 2])
+    sort_by = order[0].selectbox("Sort by", list(SORTS), index=0)
+    ascending = order[1].toggle("Ascending", value=False)
+    per_page = order[2].selectbox("Rows per page", [25, 50, 100, 250], index=1)
+    shown = shown.sort_values(SORTS[sort_by], ascending=ascending, na_position="last")
+
+    pages = max(1, -(-len(shown) // per_page))
+    # The page number is keyed on the filters, so changing one resets to page 1 rather
+    # than leaving you on page 30 of a list that now has four pages.
+    token = str((query, tuple(repos_chosen), tuple(kinds_chosen), floor, lines_floor,
+                 live_only, born_only, per_page, sort_by, ascending))
+    page = order[3].number_input("Page", 1, pages, 1, key=f"page{abs(hash(token))}")
+    start = (page - 1) * per_page
+    window = shown.iloc[start:start + per_page]
+
+    picked = st.dataframe(
+        window.assign(born=window.born.str[:10])[
+            ["repo", "path", "kind", "rework", "rework/line", "debt", "churn",
+             "lines", "commits", "devs", "days", "born", "last_month"]
+        ].rename(columns={"repo": "project", "path": "file", "days": "dev-days",
+                          "last_month": "last"}),
+        hide_index=True, width="stretch", height=520,
+        on_select="rerun", selection_mode="single-cell", key="rework_tbl",
+        column_config={
+            "project": st.column_config.TextColumn(width="small"),
+            "file": st.column_config.TextColumn(width="large"),
+            "rework": st.column_config.NumberColumn(
+                format="%d", help="Lines a commit both added and removed, summed per "
+                                  "commit. Code written over, not written."),
+            "rework/line": st.column_config.NumberColumn(
+                format="%.2f", help="Rework over lines at HEAD. 1.0 means every line "
+                                    "in the file has been written over once."),
+            "debt": st.column_config.NumberColumn(
+                format="%.1f", help="rework ÷ lines × log2(1 + commits). See the "
+                                    "definitions screen."),
+            "churn": st.column_config.NumberColumn(format="%d"),
+            "lines": st.column_config.NumberColumn(
+                format="%d", help="At HEAD. Blank means the file is gone."),
+            "commits": st.column_config.NumberColumn(format="%d"),
+            "devs": st.column_config.NumberColumn(format="%d"),
+            "dev-days": st.column_config.NumberColumn(
+                format="%d", help="One person on one calendar day counts once."),
+            "born": st.column_config.TextColumn(
+                help="First commit that added this path, inside the window. Blank "
+                     "means the file is older than the window."),
+            "last": st.column_config.TextColumn(help="Most recent month touched."),
+        },
+    )
+    hit = picked_row(picked, "rework_tbl", token + str(page), "file")
+    if hit is not None:
+        row = window.iloc[hit]
+        goto("detail", repo_path=row.repo_path, file_path=row.path,
+             cluster_id=int(row.cluster_id))
+
+    first = start + 1 if len(window) else 0
+    st.caption(
+        f"Showing {first:,}–{start + len(window):,} of {len(shown):,} files "
+        f"({len(everything):,} before filters). Sorted across the whole list, not the "
+        "page, so page 1 really is the top. Click a file name to open it."
+    )
     st.stop()
 
 if screen == "people":
